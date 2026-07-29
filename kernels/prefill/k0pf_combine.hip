@@ -1,45 +1,6 @@
-// ================================================================================================
-// k0pf_combine.hip — prefill combine: owner-pull over producers at fabric rate, no stage copy.
-//
-// The pull-side data path is the whole design.  A block-per-token combine that loops producers
-// serially pays, per producer, a synchronous block copy of the 14,336 B peer row through
-// registers into a global stage buffer, two __syncthreads, and an FP32 LDS accumulate over a
-// 28 KB accumulator — roughly four sequential fabric round trips per token, three times the
-// necessary local traffic, and CTA barriers between every producer.
-//
-// THIS KERNEL:
-//   1. DIRECT P2P READS of the symmetric `part` rows through ShmemPtrP2p.  MoRI's own combine
-//      uses the same pointer class for its source rows, but additionally stages every received
-//      row locally before its barrier; we read the producer's published row in place, so that
-//      copy does not exist on our side at all.
-//   2. WARP PER TOKEN, FOUR PRODUCERS IN FLIGHT.  Lanes 0..fanout-1 translate the up-to-8
-//      producer row pointers once, then the row is consumed in 14 x 1 KiB warp chunks.  Per
-//      chunk the producers are handled as two ordered groups of four: four 16 B/lane loads issue
-//      back to back, then their FP32 accumulation in producer order, then the next four.  That
-//      keeps roughly 4 KB per warp in flight without spilling the loaded vectors to scratch.
-//   3. ZERO LDS, ZERO __syncthreads, ZERO stage buffer.  The FP32 accumulator lives in 8
-//      registers per lane per chunk and the output is one 16 B BF16 RNE store per chunk.
-//      Tokens with empty fanout write zeros.
-//
-// NUMERICS: same FP32 accumulator, same producer order (ascending pull_src index), same BF16 to
-// FP32 unpack and RNE pack as the simple combine.  Only the load schedule changed, never the
-// arithmetic order.  The rows this kernel sums are already weighted by the GEMM's epilogue, so
-// this is a pure sum with no top-k weights.  The cross-rank barrier stays where it is; this
-// kernel changes bytes per second, not the rendezvous.
-//
-// GRAPH SAFETY: device-read pull_ptr / pull_src only, no host sync, capture-safe.  Load the
-// module with load_hip_module(init_shmem=True), since ShmemPtrP2p reads globalGpuStates.
-//
-// LAUNCH CONTRACT:
-//   fn.launch((1024,), (256,), 0, stream, out, part, pull_ptr, pull_src, stage, T, H, rank)
-//   `stage` is accepted for ABI compatibility and unused.  Grid-stride, so any grid is correct;
-//   1024 x 256 gives 4 warps per block and covers 4096 tokens.
-//
-// ISA expectations worth asserting from the compiled .s before trusting a timing run:
-//   * zero spills, zero scratch, no s_barrier, no ds_read/ds_write (no LDS at all)
-//   * producer loads batched: at least 4 vector loads before the first dependent add or store
-//   * ShmemPtrP2p present
-// ================================================================================================
+// Prefill owner-pull combine with direct P2P reads. One warp handles a token, translating up to
+// eight producer rows once and accumulating them in pull_src order. Producer loads are issued in
+// groups of four. Empty fanout writes zero; stage is retained only for ABI compatibility.
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -48,9 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-// bf16 (stored as uint16) <-> fp32:
-//   unpack : bf16 IS the top 16 bits of the fp32 -> __uint_as_float(bits << 16)   (exact)
-//   pack   : round-to-nearest-EVEN  (u + 0x7FFF + lsb) >> 16                       (matches v_cvt_pk_bf16_f32)
+// BF16 unpack is exact; packing uses round-to-nearest-even.
 __device__ __forceinline__ float k0pf_bf16_to_f32(unsigned short b) {
   return __uint_as_float((unsigned int)b << 16);
 }
@@ -93,10 +52,8 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf_combine(
       continue;
     }
 
-    // ---- producer row pointers, translated once.  Lane j < fanout owns producer j. ----
-    // Every lane that can be shuffled (0..7) owns a valid translated pointer. Inactive producer
-    // lanes point at local row 0. This lets each four-load batch issue unconditionally: guarding
-    // each load separately makes clang reconverge EXEC and drain vmcnt between producers.
+    // Translate producer row pointers once.
+    // Inactive producer lanes use local row 0 so four-load batches remain unconditional.
     unsigned long long pbase = 0ull;
     if (lane < 8) {
       int p = cur;
@@ -110,7 +67,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf_combine(
     }
 
     if (H == 7168) {
-      // 14 x 1 KiB warp chunks; all producer loads of a chunk in flight before the ordered FMA.
+      // Issue producer loads before ordered accumulation.
 #pragma unroll 1
       for (int c = 0; c < 14; ++c) {
         const size_t off = (size_t)(c << 10) + (size_t)(lane << 4);
@@ -144,7 +101,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf_combine(
         *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(orow) + off) = pk.pack;
       }
     } else {
-      // Generic path (never taken for DeepSeek-R1; correctness net only).
+      // Generic-width path.
       for (int h = lane * 8; h < H; h += 64 * 8) {
         float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
         for (int j = 0; j < fanout; ++j) {

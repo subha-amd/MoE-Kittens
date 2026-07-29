@@ -1,36 +1,9 @@
-// ================================================================================================
-// k0d_combine.hip — owner-pull combine with the all-rank rendezvous folded into the kernel head,
-// plus an optional completion signal for the next epoch's ingress.  No standalone barrier kernel.
+// Owner-pull combine with optional cross-rank synchronization and completion signaling.
+// The last block publishes arr_flags after the phase-2 writes, and all blocks wait before pulling.
+// Counters are cumulative, so synchronized launches must keep gridDim.x fixed at 16.
 //
-// Placement rationale: the release fence sits at the COMBINE head, after the phase-2 GEMM has
-// fully completed in stream order, so its epilogue writes are already in memory and the fence is
-// nearly free.  Fencing inside the GEMM tail instead has to drain every outstanding epilogue
-// atomic per CTA and measures slower at decode.  This mirrors where MoRI places its own
-// cross-device barrier: inside the combine kernel, not as a separate launch.
-//
-// RENDEZVOUS HEAD (all blocks): a cumulative grid counter; the last block to arrive bumps
-// arr_flags[cur] on every peer under a system release; every block then spins on its local copies
-// of the world's flags (bounded, fail-closed), takes an acquire fence, and proceeds to the pulls.
-// Epoch N = old / gridDim.x + 1, derived by each block from its own pre-increment value, so no
-// counter is ever reset and graph replay stays safe.
-// A combine block can only launch after this rank's phase 2 completed (stream order), so all
-// combine blocks arriving on all ranks implies every rank's phase 2 is done.  Phase 2 itself is
-// unmodified.
-//
-// TAIL SIGNAL (combine_done): a second counter after the pulls; the last block bumps
-// don_flags[cur] on every peer.  An ingress kernel that wants to overlap epochs waits on
-// don_flags.  The pulls are reads, so the fence before the poke only orders the counter after
-// them.
-//
-// COMBINE BODY: warp per token; up to 8 producer pointers translated once; all producers' 16 B
-// loads in flight per 1 KB chunk; FP32 accumulation in producer order in registers; one BF16 RNE
-// store per chunk; direct P2P reads through ShmemPtrP2p with no stage buffer, no LDS and no
-// __syncthreads in the body.  Tokens with empty fanout write zeros.
-//
-// Launch: with arr_flags == nullptr the head and tail compile away and any grid is accepted.
-// With the fused rendezvous enabled the grid must be the fixed (16, 256) decode shape so the
-// cumulative counters keep one stable blocks-per-epoch denominator across every graph replay.
-// ================================================================================================
+// The completion signal is published after all pulls, allowing the next ingress epoch to reuse
+// source buffers safely. The body accumulates producers in order with direct P2P reads.
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -55,7 +28,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_combine(
     const int* __restrict__ pull_src,         // [T*world, 2]
     unsigned short* __restrict__ stage,       // ABI compat; unused
     int T, int H, int cur,
-    // ---- fused rendezvous state (pass arr_flags == nullptr to disable it) ----
+    // Optional synchronization state; arr_flags == nullptr disables it.
     unsigned int* __restrict__ arr_flags,     // SYMMETRIC [world]: arrival flags
     unsigned int* __restrict__ arr_count,     // LOCAL [1]: cumulative arrival counter
     unsigned int* __restrict__ don_flags,     // SYMMETRIC [world]: combine_done flags
@@ -69,15 +42,15 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_combine(
     return;
   }
 
-  // ================= fused all-rank rendezvous ==================================================
+  // Cross-rank synchronization.
   if (arr_flags != nullptr) {
     __shared__ unsigned int s_N;
     if (tid == 0) {
       const unsigned int old =
           __hip_atomic_fetch_add(arr_count, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
-      s_N = old / gridDim.x + 1u;                          // this replay's epoch
-      if ((old % gridDim.x) == (gridDim.x - 1u)) {         // last combine block to arrive
-        __threadfence_system();                            // release the phase-2 writes
+      s_N = old / gridDim.x + 1u;                          // Current epoch.
+      if ((old % gridDim.x) == (gridDim.x - 1u)) {
+        __threadfence_system();                            // Release phase-2 writes.
         for (int pe = 0; pe < world; ++pe) {
           if (pe == cur) {
             __hip_atomic_fetch_add(&arr_flags[cur], 1u, __ATOMIC_RELAXED,
@@ -90,7 +63,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_combine(
         }
       }
     }
-    __syncthreads();                                       // s_N visible; arrival pokes issued
+    __syncthreads();                                       // Publish s_N within the CTA.
     if (tid < world) {
       const unsigned int N = s_N;
       volatile const unsigned int* vf = arr_flags;
@@ -101,10 +74,10 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_combine(
       }
     }
     __syncthreads();
-    __threadfence_system();                                // acquire
+    __threadfence_system();                                // Acquire peer writes.
   }
 
-  // ================= combine body ===============================================================
+  // Combine body.
   const int lane = threadIdx.x & 63;
   const int gw = blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
   const int nw = gridDim.x * (blockDim.x >> 6);
@@ -186,11 +159,11 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_combine(
     }
   }
 
-  // ================= tail signal: combine_done (feeds next epoch's ingress head-wait) ==========
+  // Signal completion for the next ingress epoch.
   if (arr_flags != nullptr && don_flags != nullptr) {
-    __syncthreads();                                       // all pulls precede the signal
+    __syncthreads();                                       // All pulls precede the signal.
     if (tid == 0) {
-      __threadfence_system();                              // order reads before the counter
+      __threadfence_system();                              // Order reads before the signal.
       const unsigned int old =
           __hip_atomic_fetch_add(don_count, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
       if ((old % gridDim.x) == (gridDim.x - 1u)) {

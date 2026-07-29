@@ -1,18 +1,6 @@
-// ================================================================================================
-// hkp_store.hpp — vectorized posted peer stores and peer pulls (see 
-// k0d_mega.hip, k0pf3_qpush.hip, k0d_push.hip, k0pf2_push — FP8 row =
-// 7 x 16 B/lane, scale row = 14 lanes x 16 B, ids/weights = 2 x uint4/float4; combine pull
-// loads: k0d_combine.hip, k0pf_combine.hip).
-//
-// Every store today is POSTED (fire-and-forget) with NO cache hints — that is the class
-// the fastest class measured on this fabric, and the class
-// that is graph-replay safe (k0pf3_qpush.hip).  cache_policy therefore DEFAULTS to
-// posted_default = today's plain stores, so a refactor onto these wrappers is
-// behavior-preserving.  streaming / non_temporal exist only behind -DHKP_ENABLE_CACHE_HINTS
-// and are EXPERIMENTAL: unmeasured on this fabric, and any hint that weakens the posted
-// store's visibility ordering relative to the doorbell's release fence invalidates the
-// rendezvous proof — re-run the poisoned two-sided gate before adopting one.
-// ================================================================================================
+// Vectorized posted peer stores and pulls.
+// Plain posted stores are the default. Cache hints require HKP_ENABLE_CACHE_HINTS and must preserve
+// visibility before the doorbell release fence.
 
 #ifndef HKP_STORE_HPP
 #define HKP_STORE_HPP

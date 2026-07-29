@@ -1,127 +1,10 @@
-// ===========================================================================
-// n1g_fused_moe.cpp — single-kernel fused expert GEMM (W13 then W2) for FP8
-// block-scaled MoE on gfx950.
+// Single-kernel FP8 expert GEMM for gfx950.
+// The persistent work count comes from device-resident num_valid_ids[0]. A bounded descriptor
+// maps padding-row loads to zero. Each CTA gathers a 32x128-byte activation tile once in memory
+// order and restores MFMA layout through XOR-swizzled LDS.
 //
-// Two properties define this kernel: the work count is read on device, and the
-// activation gather is done in memory order through a bounded descriptor.
-//
-// DEVICE-DRIVEN TASK WALK.  There is no `num_tasks` kernarg.  The work count
-// comes from num_valid_ids[0], read on device as one uniform s_load_dword into
-// an SGPR hoisted above the persistent loop and both K-loops.  This buys no
-// speed at all; it buys comparability.  A host-frozen plan cannot survive a
-// route swap, where one route's captured graph is replayed against a different
-// route's live token count.
-//
-// ---------------------------------------------------------------------------
-// THE A-GATHER READ PATH
-//
-// Three facets of one mechanism — the lane-to-address map, the redundancy it
-// removes, and the descriptor that makes dropped reads free:
-//
-//   1. ADDRESS MAP.  Gathering A directly into the MFMA fragment layout has
-//      lane L = 16q + r read input[tok(r)] + k*128 + 16q.  The 64 lanes of one
-//      wave then touch 16 different token rows, and rows of input [4096, 7168]
-//      FP8 are 7,168 B apart, so one global_load_dwordx4 touches 16 distinct
-//      128 B cache lines and uses only 64 of the 128 bytes of each.  A gather's
-//      cost is set by cache lines touched per instruction, not by instruction
-//      count.
-//      This kernel loads the tile in MEMORY order instead: thread t reads sorted
-//      row t>>3, bytes [16*(t&7), +16).  Eight consecutive lanes cover one token
-//      row's full 128 B — 8 cache lines per instruction, fully used — and the
-//      MFMA fragment layout is restored through LDS.
-//
-//   2. REDUNDANCY.  With the A tile in registers, all four waves gather the same
-//      32 x 128 B tile independently: 16,384 B requested per CTA per K128 step
-//      for a 4,096 B tile.  Here it is gathered once, CTA-wide, into LDS — one
-//      buffer_load_dwordx4 per thread — and the four waves share it.
-//
-//   3. BOUNDED BUFFER DESCRIPTOR.  Gathering A unconditionally for padding rows
-//      is in bounds only as long as the sentinel token stays below `input`'s row
-//      capacity, which is luck rather than a guarantee, and the route-swap test
-//      deliberately replays one route's graph against another route's T.  The
-//      `input` buffer descriptor is therefore bounded to num_records = T * 7168,
-//      so a padding row's load returns zero for free: no branch, no sentinel, no
-//      hazard.
-//
-//   cache lines per A-gather instruction:
-//                                      fragment-order   memory-order
-//     lines touched per instruction    16               8
-//     bytes used per line touched      64 of 128        128 of 128
-//     A-gather instrs / CTA / K128     16 (4 per wave)  4 (1 per wave)
-//     A bytes requested / CTA / K128   16,384           4,096  (= the tile)
-//
-// ---------------------------------------------------------------------------
-// WHY THE CTA BARRIER IS SAFE, AND WHY __syncthreads() IS NOT
-//
-// A CTA-shared LDS A tile needs a workgroup barrier between the ds_write and the
-// ds_read, once per K128 step.  A barrier every K step and a K-loop that never
-// drains are compatible, but only if the barrier is spelled correctly:
-//
-//   * __syncthreads() is a workgroup-scope fence over the GLOBAL address space.
-//     On AMDGPU it emits s_waitcnt vmcnt(0), which would retire all 17 in-flight
-//     weight loads once per K step.  It must not appear in the K-loop.
-//   * __builtin_amdgcn_fence(..., "workgroup", "local") restricts the fence to
-//     the LDS address space, so the memory legalizer emits s_waitcnt lgkmcnt(0)
-//     and leaves vmcnt untouched.  That, plus a bare s_barrier, is what is used
-//     here.
-//
-// The build gate asserts from the compiled ISA that the W13 K-loop still
-// contains zero s_waitcnt vmcnt(0).  A build that does not is rejected.
-//
-// ---------------------------------------------------------------------------
-// THE SOFTWARE PIPELINE
-//
-// Per K128 step k, with gA the single coalesced A load, wA its ds_write, rA the
-// 4 fragment ds_reads, gB the 16 weight loads, M the 16 MFMAs:
-//
-//     rA(k)      <- a_lds[k&1]          (4 ds_read_b128; lgkmcnt only)
-//     gA(k+2)    -> aTmp[k&1]           ( 1 VMEM)
-//     gB(k+1)    -> bf[(k+1)&1]         (16 VMEM)
-//     M(k)                              (16 MFMA: af x bf[k&1])
-//     wA(k+1)    :  aTmp[(k+1)&1] -> a_lds[(k+1)&1]   (1 ds_write_b128)
-//     s_barrier
-//
-// VMEM issue order is ... gA(k+1), gB(k)[16], gA(k+2), gB(k+1)[16] ...  M(k)
-// needs gB(k) retired, so at the MFMA block 17 loads remain in flight: gA(k+2)
-// plus the 16 of gB(k+1).  Because vmcnt retires in order, gA(k+1) — issued
-// before gB(k) — is already retired by the wait M(k) needed anyway, so wA(k+1)
-// costs no additional vmcnt wait.
-//
-// LDS hazards on the double-buffered tile, both covered by the single per-step
-// barrier:
-//   RAW  rA(k) reads a_lds[k&1], written by wA(k) one half-body earlier, with a
-//        barrier between.
-//   WAR  wA(k+2) rewrites a_lds[k&1] two half-bodies after rA(k) read it, with
-//        two barriers between.
-//
-// ---------------------------------------------------------------------------
-// THE LDS SWIZZLE — both phases at the bank-conflict minimum
-//
-// The tile is [32 rows][8 chunks][16 B].  Physical chunk = chunk ^ (row & 7).
-// Bank of (row, cp) = ((row*128 + cp*16)/4) % 32 = (row*32 + cp*4) % 32 = 4*cp.
-//
-//   WRITE (ds_write_b128; thread t: row = t>>3, chunk = t&7):
-//     each 8-lane group varies `chunk` over all 8 values, so it covers all 32
-//     banks exactly once.  64 lanes x 4 dwords = 256 dwords, 8 per bank, which
-//     is the minimum for a 1,024 B wave access.
-//
-//   READ (ds_read_b128; lane 16q+r: row = 16m+r, chunks {q, 4|q}):
-//     without the swizzle all 16 lanes sharing q would hit banks 4q..4q+3 at 16
-//     different addresses, a 16-way conflict.  With it, cp = q ^ (r&7) takes all
-//     8 values across the wave and each 4-bank group is claimed by exactly 8
-//     lanes, again the minimum.
-//     ((16m + r) & 7 == r & 7, so both row-tiles share one swizzle; and
-//      4|q == 4^q for q < 4, so the second chunk is just cp ^ 4.)
-//
-// ---------------------------------------------------------------------------
-// NUMERICS.  For live rows the A bytes fed to the MFMA are bit-identical to a
-// fragment-order gather: the same bytes arrive by a different path.  For padding
-// rows they become exact zero rather than whatever sits at input[sentinel].  A
-// padding row can only pollute its own accumulator row (MFMA D[i][:] depends
-// only on A[i][:]), and that row is already selected away by live[m][t] ? hv : 0
-// and carries sorted_weights == 0.  The live output is therefore unchanged, and
-// an FP8 NaN sitting in a padding row can no longer reach an accumulator.
-// ===========================================================================
+// The K loop double-buffers activation and weight loads. Its barrier is scoped to local memory so
+// it does not drain VMEM. The swizzle uses physical_chunk=chunk^(row&7) to reduce bank conflicts.
 
 #include "kittens.cuh"
 #include "n1g_fused_moe.hpp"
@@ -142,7 +25,7 @@ namespace production_fused_moe::n1g {
 
 namespace aiter = production_fused_moe::aiter_gfx950;
 
-// ---- production geometry (CLAUDE.md I/O contract) --------------------------
+// ---- geometry --------------------------------------------------------------
 constexpr int kExperts = 32;
 constexpr int kHidden = 7168;    // K of W13, N of W2
 constexpr int kW13N = 4096;      // rows [0,2048) gate, [2048,4096) up
@@ -150,7 +33,7 @@ constexpr int kInter = 2048;     // intermediate dim
 constexpr int kBlockM = 32;      // Opus sorted block
 constexpr int kDispatchRows = 4096;
 
-// ---- the decomposition (stock's) ------------------------------------------
+// ---- decomposition ---------------------------------------------------------
 constexpr int kChunks = 8;                        // intermediate chunks
 constexpr int kChunkCols = kInter / kChunks;      // 256
 constexpr int kWaves = 4;
@@ -172,7 +55,7 @@ constexpr int kA2Stride = 272;
 
 // ---- the CTA-shared A tile -------------------------------------------------
 // One K128 group of the 32 sorted rows: 32 rows x 8 chunks x 16 B = 4,096 B.
-// Double-buffered = 8,192 B.  Exactly the tile, gathered ONCE for the CTA.
+// Double-buffered size is 8,192 B.
 constexpr int kAChunks = 8;        // 128 B per row / 16 B per thread
 constexpr int kAChunkBytes = 16;
 
@@ -202,7 +85,7 @@ static_assert(racc::height == 1 && racc::width == 1);
 static_assert(racc::packed_per_thread == 2);              // 4 floats / lane
 
 // ---------------------------------------------------------------------------
-// The WEIGHT loader.  Two 16-byte vector loads per lane,
+// Weight loader: two 16-byte vector loads per lane,
 // no LDS, no swizzle, no barrier, register destination.  The AITER preshuffled
 // tile's second stride group sits one 1,024 B wave window later.
 // ---------------------------------------------------------------------------
@@ -219,62 +102,13 @@ __device__ __forceinline__ const float* accf(const racc& a) {
   return reinterpret_cast<const float*>(&a.tiles[0][0].data[0]);
 }
 
-// ===========================================================================
-// REGISTER CLASS AND FOLD FORM.
-//
-// WHY.  Per K128 step the kernel keeps live, per lane: acc 64 regs, the double-buffered
-// FP8 weight fragments `bf` 128 regs, `af` 16, `aTmp` 8, up to 64 MFMA partials
-// `p` (the sched_group_barrier groups all 16 MFMAs), plus ~40 for addressing and
-// scales.  Peak ~320 > the 256-ArchVGPR ADDRESSING CAP.  LLVM resolves it by
-// putting the MFMA DESTINATIONS in the AGPR file -- and every partial must then
-// be copied back with `v_accvgpr_read_b32` before it can be folded.  That copy is
-// 64 copies per K128 step per wave, in BOTH inner loops.  The production kernel
-// issues zero of them.
-//
-// The production kernel resolves the same pressure the other way round: its AGPRs
-// are not accumulators but operand staging, and its MFMA destinations are
-// ArchVGPRs.  On CDNA4 an MFMA may read srcA/srcB straight out of the AGPR
-// file at ZERO instruction cost.  Staging the 128 weight registers there frees
-// enough ArchVGPRs for all 64 partials, and the fold then reads them IN PLACE.
-//
-// HOW.  `asm("" : "+a"(v))` is a no-op with an AGPR ("a") register constraint on a
-// 256-bit operand -- exactly the class an MFMA srcA/srcB tuple wants.  It has no
-// side effects and no memory clobber, so it does not fence the scheduler; the
-// coalescer folds the `buffer_load`'s destination directly into the AGPR.
-//
-// AND THE FOLD.  racc's payload is already `float2 data[2]` (packed_per_thread==2),
-// so the scaled add is naturally TWO packed ops.  Spelling it as four scalar FMAs
-// on a `float*` alias defeats that; spelling the identical arithmetic on the
-// float2 pairs is what selects `v_pk_fma_f32`.  Same operands, same order, same
-// fresh-FP32-partial-per-K128 rule.  32 packed FMAs per K step, which is what the
-// production kernel's fold compiles to.
-//
-// NOT TOUCHED, and this must stay true: the decomposition, the grid, the
-// persistent device walk, the A gather + XOR-swizzled LDS tile, `load_bfrag`
-// itself, the LDS BF16 output transpose, the atomic epilogue, the SiLU / dynamic
-// amax / A2 quant path, the scale MATH and its indexing, the padding gates, every
-// sched_group_barrier, every barrier, the LDS budget, the tolerance.
-//
-// EXPLICITLY NOT RETRIED: SGPR weight descriptors.  That change lands but costs
-// about 14 µs.  The weight addressing is untouched here.
-// ===========================================================================
+// The backend stages MFMA operands in AGPRs while keeping destinations in VGPRs. Packed float2
+// accumulation selects paired FP32 operations without changing arithmetic order.
 typedef __attribute__((__vector_size__(8 * sizeof(int)))) int agpr_frag_t;
 typedef __attribute__((__vector_size__(2 * sizeof(float)))) float f32x2;
 
-// Stage one FP8 MFMA operand fragment (8 dwords = one AReg_256 tuple) in the AGPR
-// file.  Zero instructions when the coalescer folds the load; a v_accvgpr_write if
-// it cannot.
-//
-// This path is compiled OUT by default, and the reason is worth keeping.  Pinning
-// the FP8 weight fragments into the AGPR file with an explicit "+a" inline-asm
-// constraint does work -- MFMA srcB becomes a[..] -- but LLVM still keeps the MFMA
-// DESTINATIONS in AGPRs, so all 64 v_accvgpr_read_b32 per K128 step survive, the
-// fold can no longer pack (v_pk_fma_f32 cannot source an AGPR pair), and it injects
-// two vmcnt(0) full drains into the W13 K-loop.
-//
-// What ships instead is `-mllvm -amdgpu-mfma-vgpr-form=1`, which makes the backend
-// select the vgprcd MFMA form.  It stages the operands in the AGPR file by itself,
-// for free, and needs no inline asm at all.
+// Optional explicit AGPR staging. The default backend flag selects VGPR destinations without
+// introducing VMEM drains.
 #ifndef N1G_STAGE_AGPR
 #define N1G_STAGE_AGPR 0
 #endif
@@ -296,9 +130,9 @@ __device__ __forceinline__ const f32x2* accv(const racc& a) {
 }
 
 // ---------------------------------------------------------------------------
-// The CTA barrier for the LDS A tile.  LOCAL ADDRESS SPACE ONLY.
+// Local-memory-only CTA barrier for the activation tile.
 //
-// `__syncthreads()` fences the GLOBAL address space at workgroup scope and emits
+// `__syncthreads()` fences global memory at workgroup scope and emits
 // `s_waitcnt vmcnt(0)`, which would retire all 17 in-flight weight loads once
 // per K step.  Restricting the fence to LDS makes the memory legalizer emit
 // `s_waitcnt lgkmcnt(0)` and nothing else.  The build gate verifies from the ISA
@@ -310,9 +144,7 @@ __device__ __forceinline__ void lds_cta_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-// ===========================================================================
-// THE FUSED KERNEL
-// ===========================================================================
+// Fused kernel.
 __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
     const std::uint8_t* __restrict__ A_bytes,   // input  [4096, 7168] FP8
     const float* __restrict__ A_scale,          // input_scale, group-major live
@@ -336,11 +168,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
   // The wave-local BF16 output transpose.
   __shared__ __align__(16) std::uint32_t xp_lds[kWaves][kBlockM][32];
 
-  // ---- THE ONE VARIABLE: the CTA-shared, double-buffered A tile -------------
-  // [buf][sorted row][physical 16 B chunk].  4,096 B per buffer = exactly one
-  // K128 group of the 32-row block.  Gathered ONCE per CTA (a register-resident
-  // A tile gathers it once per wave, i.e. four times,
-  // once per wave), by one 16 B load per thread, in MEMORY order.
+  // CTA-shared, double-buffered activation tile: [buffer][row][16-byte chunk].
   __shared__ __align__(16)
       std::uint8_t a_lds[2][kBlockM][kAChunks][kAChunkBytes];
 
@@ -349,36 +177,23 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
   const int wv = tid >> 6;   // wave 0..3
   const int q = lane >> 4;   // 0..3
   const int r = lane & 15;   // 0..15
-  const int T = nvi[1];      // live token count -- read ON DEVICE
+  const int T = nvi[1];
 
-  // ---- the work count, read ON DEVICE --------------------------------------
-  // `nvi` is a kernarg pointer and the index is the literal 0, so the address
-  // is wave-uniform and LLVM selects `s_load_dword` -> SGPR.  It sits OUTSIDE
-  // the persistent task loop and outside BOTH K-loops: one scalar load, once,
-  // for the life of the kernel.  `num_tasks = ceil(nvi[0]/32) * 8` is EXACTLY
-  // stock's block gate composed with our (block, chunk) task id: task>>3 = blk,
-  // and `task < num_tasks` iff `blk*32 < nvi[0]`.  Same predicate, same
-  // coverage, same work.  There is now NO by-value kernarg at all.
+  // Device-derived work count; the wave-uniform load is hoisted above the persistent loop.
   const int num_tasks = (((nvi[0] + (kBlockM - 1)) >> 5) << 3);
 
-  // ---- THE BOUNDED INPUT DESCRIPTOR ----------------------------------------
-  // num_records = T * Xs.  EVERY A load goes through it, so a padding row
-  // (token >= T  =>  voffset >= T*Xs) returns ZERO in hardware: no branch, no
-  // sentinel, and no out-of-bounds read on ANY route, including a route-swapped
-  // graph replay.  It is free.
+  // Bound the descriptor to T rows so padding loads return zero.
   const std::uint32_t a_num_records =
       static_cast<std::uint32_t>(T) * static_cast<std::uint32_t>(kHidden);
   const i32x4 a_rsrc = make_srsrc(A_bytes, a_num_records, 0);
 
-  // A-tile fill coordinates.  Thread t owns sorted row t>>3 and bytes
-  // [16*(t&7), +16) of that row's 128 B K128 slice, so EIGHT CONSECUTIVE LANES
-  // COVER ONE TOKEN ROW'S FULL 128 B CACHE LINE.
+  // Eight consecutive lanes cover one row's 128-byte K group.
   const int a_row = tid >> 3;              // 0..31
   const int a_chunk = tid & 7;             // 0..7
   const int a_cp = a_chunk ^ (a_row & 7);  // the XOR swizzle (see header)
 
   // Each wave owns intermediate columns [64*wv, +64) of this chunk, so it sits
-  // entirely inside ONE 128-wide block-scale group / A2 quant group.
+  // entirely inside one 128-wide block-scale group and A2 quant group.
   const int j_w = wv >> 1;
 
   for (int task = blockIdx.x; task < num_tasks; task += kCTAs) {
@@ -410,8 +225,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
     }
     __syncthreads();
 
-    // input_scale live prefix is GROUP-MAJOR: input_scale[k128 * T + token].
-    // NOT the [4096,56] capacity stride.
+    // input_scale uses group-major live-prefix stride: input_scale[k128*T+token].
     for (int idx = tid; idx < kKGroups * kBlockM; idx += kThreads) {
       const int k = idx >> 5;
       const int i = idx & 31;
@@ -423,19 +237,13 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
     __syncthreads();
 
     // Byte offset of this thread's 16 B slice of the A tile at K128 group 0.
-    // For a PADDING row, tok_lds[a_row] >= T, so this base is >= T*7168 =
-    // num_records and every A load from it is bounded to zero.  Unsigned wrap on
-    // a wild sentinel is harmless for the same reason: the DESCRIPTOR, not the
-    // address arithmetic, is what keeps us in bounds.
+    // The descriptor maps padding-row offsets to zero, including wrapped sentinels.
     const std::uint32_t a_voff0 =
         static_cast<std::uint32_t>(tok_lds[a_row]) *
             static_cast<std::uint32_t>(kHidden) +
         static_cast<std::uint32_t>(a_chunk * kAChunkBytes);
 
-    // =======================================================================
-    // GEMM-1 : PAIRED gate/up.  gate cols [256g + 64w, +64) and up cols
-    // [2048 + 256g + 64w, +64) -- same tile, same iteration.
-    // =======================================================================
+    // Paired gate/up GEMM over matching column tiles.
     racc acc[2][2][kColTiles];
 #pragma unroll
     for (int gu = 0; gu < 2; ++gu) {
@@ -455,8 +263,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
     __uint128_t aTmp[2];       // [k&1]      A(k) in flight / awaiting its ds_write
     rfp8 bf[2][2][kColTiles];  // [buf][gate/up][col]
 
-    // ---- gA: the ONE coalesced, BOUNDED A load.
-    //      8 cache lines per instruction, 100% of every line consumed.
+    // Coalesced activation load through the bounded descriptor.
     auto load_a = [&](int k, int buf) __attribute__((always_inline)) {
       aTmp[buf] = llvm_amdgcn_raw_buffer_load_b128(
           a_rsrc, a_voff0 + static_cast<std::uint32_t>(k * 128), 0u, 0u);
@@ -496,8 +303,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
       }
     };
 
-    // ---- M: the MFMA block.  A FRESH FP32 partial per K128 group
-    //      (srcC = 0 on every MFMA), scaled, then added.
+    // MFMA block with a fresh FP32 partial per K128 group.
     auto mfma_k = [&](int k, int buf) __attribute__((always_inline)) {
       const float4 as0 =
           *reinterpret_cast<const float4*>(&ascale_lds[k][4 * q]);
@@ -511,7 +317,6 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
 #pragma unroll
         for (int gu = 0; gu < 2; ++gu) {
           const float bs = (gu == 0) ? bsg : bsu;
-          // The SAME scale, hoisted once per (m, gu) and pre-packed: 2 v_pk_mul.
           const f32x2 bsv = {bs, bs};
           const f32x2 s0 = f32x2{as.x, as.y} * bsv;
           const f32x2 s1 = f32x2{as.z, as.w} * bsv;
@@ -521,7 +326,6 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
             zero(p);
             mma_ABt(p, af[m], bf[buf][gu][c], p);
             // cf[t] += pf[t] * (bs * asv[t]) for t in [0,4), spelled packed:
-            // TWO v_pk_fma_f32 instead of four scalar FMAs plus four AGPR reads.
             const f32x2* pf = accv(p);
             f32x2* cf = accv(acc[gu][m][c]);
             cf[0] += pf[0] * s0;
@@ -540,10 +344,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
 
 #pragma unroll 1
     for (int k = 0; k < kKGroups; k += 2) {
-      // Indices are CLAMPED, never guarded: an `if (k+1 < K)`
-      // makes the two halves test different predicates, LLVM versions them, and
-      // only one half keeps the partial-vmcnt schedule.  The redundant tail read
-      // is L2-resident.
+      // Clamp prefetches so both halves keep the same control flow.
       const int ka2 = (k + 2 < kKGroups) ? (k + 2) : (kKGroups - 1);
       const int ka3 = (k + 3 < kKGroups) ? (k + 3) : (kKGroups - 1);
       const int kb1 = (k + 1 < kKGroups) ? (k + 1) : (kKGroups - 1);
@@ -575,7 +376,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
     }
 
     // =======================================================================
-    // REGISTER SiLU + DYNAMIC per-(row, K128) amax + FP8 quant -> A2 in LDS.
+    // SiLU and per-row K128 FP8 quantization into LDS.
 
     // =======================================================================
     bool live[2][4];
@@ -599,7 +400,6 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
         for (int t = 0; t < 4; ++t) {
           const float gv = gf[t];
           const float hv = (gv / (1.0f + __expf(-gv))) * uf[t];
-          // SELECT, never multiply by a mask.
           const float h = live[m][t] ? hv : 0.0f;
           a2v[m][c][t] = h;
           lmax[m][t] = fmaxf(lmax[m][t], fabsf(h));
@@ -628,8 +428,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
     }
     __syncthreads();
 
-    // THE EPSILON IS NOT A NICETY.  448.0f / max(amax, 1e-6f); rank 2 has two
-    // EMPTY experts (12 and 30) and 448/0 = Inf makes A2q NaN.
+    // The epsilon prevents NaN for empty experts.
 #pragma unroll
     for (int m = 0; m < 2; ++m) {
       float dq[4];
@@ -651,7 +450,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
     __syncthreads();
 
     // =======================================================================
-    // GEMM-2 : SPLIT-K W2 + the LDS BF16 OUTPUT TRANSPOSE.
+    // Split-K W2 and BF16 output transpose.
     // 2 cache lines per atomic.
     // =======================================================================
     rfp8 a2f[2][2];  // [rowtile][kb]
@@ -665,7 +464,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
         d[1] = *reinterpret_cast<const float4*>(p + 64);
       }
     }
-    // DEQUANTIZE BEFORE THE ATOMIC.
+    // Dequantize before the atomic.
     float dq2[2][2];
 #pragma unroll
     for (int m = 0; m < 2; ++m) {
@@ -732,7 +531,7 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
       }
       __builtin_amdgcn_sched_barrier(0);
 
-      // PHASE 1 (write, MFMA layout): lane 16q+r holds sorted rows {r, 16+r}.
+      // Write MFMA layout; lane 16q+r holds rows {r,16+r}.
 #pragma unroll
       for (int m = 0; m < 2; ++m) {
         const int row = 16 * m + r;
@@ -754,15 +553,12 @@ __global__ __launch_bounds__(kThreads, 1) void n1g_fused_moe_kernel(
         }
       }
 
-      // The transpose is WAVE-LOCAL, so this RAW needs NO CTA barrier.
+      // The transpose is wave-local; no CTA barrier is needed.
       __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
       __builtin_amdgcn_s_waitcnt(0xc07f);  // lgkmcnt(0); vmcnt/expcnt free
       __builtin_amdgcn_wave_barrier();
 
-      // PHASE 2 (read, ATOMIC layout): 2 CACHE LINES PER ATOMIC.
-      // MEMORY SAFETY: the output atomic is UNBOUNDED.  `xtok[i] < T` is uniform
-      // across each 32-lane half, so a padding row's half-wave is EXEC-masked off
-      // and forms no address at all.
+      // Read atomic layout. token<T prevents address formation for padding rows.
       const int col_base = (kN2Unroll * kWaves * 16) * it + 64 * wv;
 #pragma unroll
       for (int i = 0; i < 16; ++i) {

@@ -1,51 +1,13 @@
-// ================================================================================================
-// k0d_push.hip — plan-free push dispatch for decode, with a folded doorbell rendezvous.
+// Plan-free decode push. One warp handles a token and deduplicates routes by destination; the
+// lowest matching slot allocates a receive row. Arrival order is nondeterministic.
 //
-// A pull-based dispatch has to pay for three things a push producer does not:
-//   1. a route all-gather plus a full plan build, needed only because a pull consumer must know
-//      every rank's routes to decide what to pull;
-//   2. a barrier before the pull, needed only because a pull consumer must wait for REMOTE
-//      quantization before reading remote rows;
-//   3. the pull itself.
-// A push producer reads only its own routes (already local) and its own quantized rows (local,
-// in stream order after the quant kernel, so it never waits on a remote quant), allocates receive
-// rows on the destination with a remote-atomic slot allocator, and posts payload stores
-// fire-and-forget through ShmemPtrP2p.  The sorted GEMM metadata the plan used to build is
-// rebuilt destination-side from the received expert ids by k0d_dsort.
+// Each CTA fences its posted payload stores before incrementing grid_count. The last CTA signals
+// recv_doorbell[cur] on every rank. Doorbells are monotonic and never reset; k0d_dsort resets the
+// receive-row allocator after consuming it.
 //
-// WHAT (one warp per source token tau):
-//   lane s < TOPK holds slot s:  eid = my_ids[tau*TOPK+s], dest = eid / E (E = experts per rank).
-//   Routes are DEDUPLICATED by destination: a (token, dest) pair is pushed once no matter how
-//   many of the token's slots land there, and the lowest such slot is PRIMARY.  Primary lanes
-//   allocate one receive row each with a remote atomicAdd on the destination's dest_counter (an
-//   agent-scope local atomic when the destination is this rank); the returned value IS the
-//   arrival row.  Arrival order is nondeterministic.
-//   The warp then loads its 7168 B FP8 row once (7 x 16 B per lane) and, for each destination,
-//   posts 7 row stores plus a 224 B row-major scale store, a 32 B expert-id store and a 32 B
-//   route-weight store into that rank's symmetric receive buffers.
-//   Owner-side combine staging (pull_stage / pull_cnt) is written locally as it goes: the owner
-//   already knows where each of its tokens landed, so pull_src needs no all-gather either.
-//
-// RENDEZVOUS (folded, reset-free, monotonic):
-//   every CTA does __syncthreads, then thread 0 issues __threadfence_system to release all of its
-//   payload stores and bumps an arrival counter.  The last arriving CTA bumps recv_doorbell[cur]
-//   on every rank.  recv_doorbell[src] on rank R therefore counts R's completed pushes from src,
-//   forever.  k0d_dsort waits for recv_doorbell[src] >= epoch against a local epoch counter.  No
-//   flag is ever reset; dest_counter is reset by k0d_dsort's tail, its only reader.
-//
-// CROSS-EPOCH SAFETY:
-//   * push(N+1) cannot write rank R's receive buffers while R still reads them for epoch N:
-//     push(N+1) starts only after this rank's combine(N) returned in stream order, and the
-//     combine head fires only after every rank's phase-2 GEMM for epoch N completed, which is
-//     after R's sort and GEMM.
-//   * the reverse hazard (a remote combine(N) still pulling this rank's part while the next epoch
-//     reuses it) is closed by k0d_dsort's doorbell wait, not here.
-//
-// GRAPH SAFETY: posted peer stores and remote atomics through ShmemPtrP2p only.  No host reads;
-// every count is device-side.
-//
-// pperr bits owned here: 128 receive-row overflow (T_loc_max), 256 shape guard.
-// ================================================================================================
+// Stream order prevents push(N+1) from overwriting receive buffers used by epoch N. The
+// k0d_dsort doorbell wait prevents part reuse while a remote combine still reads it.
+// pperr: 128 receive-row overflow, 256 shape guard.
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -85,20 +47,19 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_push(
   }
 
   for (int tau = gw; tau < T; tau += nw) {
-    // ---- slot s on lane s; lanes >= TOPK are inert (dest = -1, never primary) ----
+    // Lanes below TOPK own slots; other lanes use dest = -1.
     const int s = lane;
     const int eid = (s < TOPK) ? my_ids[(size_t)tau * TOPK + s] : -1;
     const float wgt = (s < TOPK) ? my_wgt[(size_t)tau * TOPK + s] : 0.0f;
     const int dest = (eid >= 0) ? eid / E : -1;
 
-    // Dedup by destination.  The tau loop trip count is warp-uniform, so the match executes in
-    // convergent context (the k0d_fused rule: the collective must not sit in a divergent guard).
+    // __match_any_sync must execute in warp-uniform control flow.
     const unsigned long long match = __match_any_sync(__activemask(), dest);
     const bool primary = (s < TOPK) && ((match & ((1ULL << s) - 1ULL)) == 0ULL);
     const unsigned long long pmask = __ballot(primary);
     const int fanout = __popcll(pmask);
 
-    // ---- receive-row allocation: one remote atomicAdd per (token, dest), lane-parallel ----
+    // One receive-row allocation per distinct destination.
     unsigned int row = 0u;
     if (primary) {
       if (dest == cur) {
@@ -112,16 +73,16 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_push(
       if (row >= (unsigned int)T_loc_max) atomicOr(pperr, 128);
     }
 
-    // ---- owner-side combine staging (LOCAL): the owner knows where its tokens landed ----
+    // Record destination rows for owner-side combine.
     if (s < TOPK) {
       pull_stage[((size_t)tau * TOPK + s) * 2 + 0] = primary ? dest : -1;
       pull_stage[((size_t)tau * TOPK + s) * 2 + 1] = primary ? (int)row : -1;
     }
     if (lane == 0) pull_cnt[tau] = fanout;
 
-    if (fanout == 0) continue;   // defensive; a live token always has destinations
+    if (fanout == 0) continue;
 
-    // ---- payload registers: row loaded ONCE (7 x 16 B/lane); scales one 224 B request ----
+    // Load the row once before fanout.
     const unsigned char* srow = a_src + (size_t)tau * K0PD_K;
     uint4 v[7];
 #pragma unroll
@@ -133,7 +94,6 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_push(
           reinterpret_cast<const unsigned char*>(sc_src) + (size_t)tau * (K0PD_NG * 4) +
           (lane << 4));
 
-    // metadata vectors packed from the per-slot lane registers (uniform shfls)
     const uint4 ep0 = make_uint4((unsigned int)__shfl(eid, 0), (unsigned int)__shfl(eid, 1),
                                  (unsigned int)__shfl(eid, 2), (unsigned int)__shfl(eid, 3));
     const uint4 ep1 = make_uint4((unsigned int)__shfl(eid, 4), (unsigned int)__shfl(eid, 5),
@@ -141,7 +101,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_push(
     const float4 wp0 = make_float4(__shfl(wgt, 0), __shfl(wgt, 1), __shfl(wgt, 2), __shfl(wgt, 3));
     const float4 wp1 = make_float4(__shfl(wgt, 4), __shfl(wgt, 5), __shfl(wgt, 6), __shfl(wgt, 7));
 
-    // ---- fanout stores, ascending slot order; every store POSTED (fire-and-forget) ----
+    // Post fanout stores in ascending slot order.
     unsigned long long pm = pmask;
 #pragma unroll 1
     for (int j = 0; j < fanout; ++j) {
@@ -149,7 +109,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_push(
       pm &= pm - 1;
       const int pe = __shfl(dest, src_lane);
       const int drow_id = __shfl((int)row, src_lane);
-      if (drow_id < 0 || drow_id >= T_loc_max) continue;   // overflow already flagged
+      if (drow_id < 0 || drow_id >= T_loc_max) continue;
       unsigned char* drow = reinterpret_cast<unsigned char*>(mori::shmem::ShmemPtrP2p(
           (uint64_t)(a_dst + (size_t)drow_id * K0PD_K), pe));
 #pragma unroll
@@ -174,10 +134,10 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_push(
     }
   }
 
-  // ---- folded doorbell: publish ALL this rank's pushes before any consumer reads them ----
+  // Publish this rank's pushes before consumers read them.
   __syncthreads();
   if (threadIdx.x == 0) {
-    __threadfence_system();   // release this CTA's payload stores system-wide BEFORE arrival
+    __threadfence_system();   // Release this CTA's payload stores before arrival.
     const unsigned int old =
         __hip_atomic_fetch_add(grid_count, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     if ((old % gridDim.x) == (gridDim.x - 1)) {

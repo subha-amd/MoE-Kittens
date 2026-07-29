@@ -1,12 +1,4 @@
-// ================================================================================================
-// k0pf_frozen_plan.cpp — local plan construction for the pull-based path: build_plan_prod (the
-// deterministic multi-stage plan) and zero_partial.  HipKittens plus pybind only; no MPI and no
-// transport code.  Cross-rank movement lives in the .hip kernels under kernels/decode and
-// kernels/prefill.
-//
-// The plan is built from integer prefix sums, so its outputs are algorithm-independent: any
-// correct implementation produces the same values.
-// ================================================================================================
+// Deterministic local plan construction with an explicit capture-stream handle.
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
 #include <hip/hip_fp8.h>
@@ -31,21 +23,18 @@ struct plan_globals_e12 {
     gl<int,   -1, -1, -1, -1> cnt;        // [E, 1]          rows per local expert
     gl<int,   -1, -1, -1, -1> erb;        // [E+1, 1]        32-padded exclusive prefix; erb[E] = padded_rows
     gl<int,   -1, -1, -1, -1> ccnt;       // [NCHUNK, E]     per-(chunk,expert) counts (the ordered compaction)
-    // --- out: the PRODUCTION CONTRACT ---
+    // --- output ---
     gl<int,   -1, -1, -1, -1> gath;       // [T_loc_max, 2]  (src_rank, src_token) — the DEDUP'd gather map
     gl<int,   -1, -1, -1, -1> sorted_token_ids;   // [PADMAX, 1]  token | slot<<24
     gl<float, -1, -1, -1, -1> sorted_weights;     // [PADMAX, 1]
     gl<int,   -1, -1, -1, -1> sorted_expert_ids;  // [PADMAX/32, 1]
     gl<int,   -1, -1, -1, -1> num_valid_ids;      // [2, 1]  {padded_rows, T_loc}
-    // --- out: the COMBINE's pull plan (free, from determinism) ---
+    // --- combine pull plan ---
     gl<int,   -1, -1, -1, -1> pull_ptr;   // [T+1, 1]
     gl<int,   -1, -1, -1, -1> pull_src;   // [T*world, 2]  (producer_rank, producer_row)
-    // --- out: THE OVERFLOW FLAG.  kernel.cpp:396 does `if (dst < g.Mpacked_max)` and SILENTLY DROPS
-    // every row past the capacity — a route that overflows the pack LOSES TOKENS AND SAYS NOTHING.
-    // That is a correctness bug that presents as a small accuracy regression.  We FAIL LOUDLY:
+    // Capacity errors:
     //   bit0 = T_loc  overflowed T_loc_max      bit1 = a sorted row overflowed PADMAX
     //   bit2 = E > E12_MAXE                     bit3 = fanout overflowed the pull_src capacity
-    // The host asserts err == 0 after the plan and BEFORE anything is timed.
     gl<int,   -1, -1, -1, -1> err;        // [1, 1]
     int world, T, TOPK, E, cur_rank, T_loc_max, PADMAX;
     uint64_t stream_handle;
@@ -66,8 +55,7 @@ __global__ void e12_reset_kernel(plan_globals_e12 g) {
 }
 
 // --- own[p][gtok] : does rank p hold at least one of gtok's top-8 experts? -----------------------
-// This is the DEDUP predicate.  The old path pulled a token once PER (token, expert-on-this-rank)
-// pair; we pull it once per DISTINCT token and let the GEMM re-read the row from LDS for free.
+// Pull each token once per destination rank.
 __global__ void e12_own_kernel(plan_globals_e12 g) {
     const int N   = g.world * g.T;
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;   // over world * N
@@ -86,8 +74,7 @@ __global__ void e12_own_kernel(plan_globals_e12 g) {
 }
 
 // --- tof[p][*] : exclusive prefix of own[p]; tloc[p] = total.  One BLOCK per rank p. ------------
-// Serial within the block (N = 3,248) — deterministic by construction and a few microseconds.
-// the scan: inclusive block scan helper (Hillis-Steele, deterministic).
+// Inclusive Hillis-Steele block scan.
 __device__ __forceinline__ int e26_block_incl_scan(int v, int* tmp) {
     const int tid = threadIdx.x;
     tmp[tid] = v;
@@ -103,10 +90,7 @@ __device__ __forceinline__ int e26_block_incl_scan(int v, int* tmp) {
     return r;
 }
 
-// the scan: PARALLEL per-rank exclusive prefix sum of own[p][0..N).  Was thread-0 serial over N=3248
-// (8 threads on the whole GPU).  One BLOCK per rank, 256-thread block scan with a running carry
-// across tiles.  Output tof[i] / tloc[p] is byte-identical to the serial version (prefix sum is
-// deterministic) — verified by the plan-equivalence oracle.
+// Per-rank exclusive prefix using 256-thread tiles and a running carry.
 __global__ void e12_tof_kernel(plan_globals_e12 g) {
     const int p = blockIdx.x;                       // one block per rank
     if (p >= g.world) return;
@@ -129,7 +113,7 @@ __global__ void e12_tof_kernel(plan_globals_e12 g) {
     if (threadIdx.x == 0) g.tloc[{0, 0, p, 0}] = s_carry;
 }
 
-// --- gath[t] = (src_rank, src_token) for THIS rank; num_valid_ids[1] = T_loc --------------------
+// --- gath[t] for this rank; num_valid_ids[1] = T_loc -------------------------------------------
 __global__ void e12_gath_kernel(plan_globals_e12 g) {
     const int N   = g.world * g.T;
     const int gtok = blockIdx.x * blockDim.x + threadIdx.x;
@@ -143,7 +127,7 @@ __global__ void e12_gath_kernel(plan_globals_e12 g) {
     if (!own[gtok]) return;
 
     const int t = tof[gtok];
-    if (t >= g.T_loc_max) { atomicOr(&g.err[{0, 0, 0, 0}], 1); return; }   // LOUD, not silent
+    if (t >= g.T_loc_max) { atomicOr(&g.err[{0, 0, 0, 0}], 1); return; }
     g.gath[{0, 0, t, 0}] = gtok / g.T;               // src_rank
     g.gath[{0, 0, t, 1}] = gtok % g.T;               // src_token
 }
@@ -164,8 +148,8 @@ __global__ void e12_count_kernel(plan_globals_e12 g) {
     }
 }
 
-// --- 32-PADDED exclusive prefix over experts (erb), and the per-chunk base for each expert -------
-// erb[E] = padded_rows = num_valid_ids[0].  This is where PLAN_PAD 256 -> 32 lands.
+// --- 32-padded expert prefix and per-chunk bases -----------------------------------------------
+// erb[E] = padded_rows = num_valid_ids[0].
 // Also writes sorted_expert_ids (one entry per 32-row block) and turns ccnt into an exclusive prefix
 // over CHUNKS within each expert, based at erb[e].  One block; E = 32 and NCHUNK ~ 102.
 __global__ void e12_scan_kernel(plan_globals_e12 g) {
@@ -207,12 +191,8 @@ __global__ void e12_scan_kernel(plan_globals_e12 g) {
     }
 }
 
-// --- initialise every sorted row to the PADDING SENTINEL ----------------------------------------
-// Production's padding convention: a row is padding iff token >= T or slot >= topk, and its
-// sorted_weights is zero.  We use token = T_loc (read ON DEVICE — exactly stock's own convention:
-// stock pins its sentinel to token == T) and slot = TOPK.  the GEMM's `input` buffer descriptor is bounded
-// to T_loc * 7168, so such a row's A load returns ZERO FOR FREE — no branch, no hazard.  A padding
-// row suppresses the STORE, never the LOAD; the bounded descriptor is what makes the LOAD safe.  MUST run after e12_gath_kernel has written num_valid_ids[1].
+// --- initialize padding rows ------------------------------------------------------------------
+// The bounded GEMM descriptor maps token=T_loc padding loads to zero. Run after gath writes T_loc.
 __global__ void e12_pad_kernel(plan_globals_e12 g) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= g.PADMAX) return;
@@ -221,13 +201,8 @@ __global__ void e12_pad_kernel(plan_globals_e12 g) {
     g.sorted_weights [{0, 0, i, 0}] = 0.f;
 }
 
-// --- THE ORDERED COMPACTION — this is where the SLOT that kernel.cpp threw away is KEPT ---------
-// One block per chunk of E12_CHUNK consecutive pairs.  Thread 0 walks the chunk IN INDEX ORDER,
-// maintaining a per-expert cursor initialised from ccnt[chunk][e].  Order = increasing pair index =
-// deterministic on every rank.  256 serial steps per block, 102 blocks in parallel: negligible.
-//
-//   sorted_token_ids[row] = local_token_index | (slot << 24)     <- THE SLOT.  kernel.cpp:393 dropped
-//   sorted_weights  [row] = all_wgt[pair]                           this, and with it the weight.
+// --- ordered compaction -----------------------------------------------------------------------
+// Preserve increasing pair order and pack slot in the high eight bits.
 __global__ void e12_sorted_kernel(plan_globals_e12 g) {
     __shared__ int s_cur[E12_MAXE];
     const int c  = blockIdx.x;
@@ -243,10 +218,7 @@ __global__ void e12_sorted_kernel(plan_globals_e12 g) {
         s_cur[e] = g.ccnt[{0, 0, c * E + e, 0}];
     __syncthreads();
 
-    // the scan: PARALLEL.  Was thread-0 serial over the 256-pair chunk (1 thread/block).  One THREAD
-    // per pair (E12_CHUNK == blockDim.x == 256).  row = ccnt-base + (count of EARLIER same-expert
-    // pairs in this chunk) — the per-key exclusive rank in index order EXACTLY reproduces the serial
-    // cursor increment order, so sorted_token_ids/sorted_weights are byte-identical (oracle-checked).
+    // Rank each pair by earlier same-expert pairs in this chunk.
     __shared__ int s_le[E12_CHUNK];                       // per-thread local expert, -1 if not ours
     const int*   ids = &g.all_ids[{0, 0, 0, 0}];
     const int j = j0 + threadIdx.x;
@@ -262,12 +234,12 @@ __global__ void e12_sorted_kernel(plan_globals_e12 g) {
         int rank = 0;                                     // earlier same-expert pairs, index order
         for (int u = 0; u < threadIdx.x; ++u) rank += (s_le[u] == le);
         const int row = s_cur[le] + rank;
-        if (row >= g.PADMAX) { atomicOr(&g.err[{0, 0, 0, 0}], 2); }               // LOUD
+        if (row >= g.PADMAX) { atomicOr(&g.err[{0, 0, 0, 0}], 2); }
         else {
             const float* wgs = &g.all_wgt[{0, 0, 0, 0}];
             const int*   tof = &g.tof[{0, 0, 0, 0}] + (size_t)g.cur_rank * N;
             const int gtok = j / g.TOPK;
-            const int slot = j % g.TOPK;                  // <<<< THE SLOT.
+            const int slot = j % g.TOPK;
             const int t    = tof[gtok];                   // this rank's LOCAL token index (dedup'd)
             g.sorted_token_ids[{0, 0, row, 0}] = (t & 0x00FFFFFF) | (slot << 24);
             g.sorted_weights  [{0, 0, row, 0}] = wgs[j];
@@ -275,10 +247,8 @@ __global__ void e12_sorted_kernel(plan_globals_e12 g) {
     }
 }
 
-// --- the COMBINE's pull plan — free, because the layout is deterministic ------------------------
-// For each token this rank OWNS (its own T tokens, global index cur_rank*T + tau), list every rank p
-// that produced a partial for it, together with THAT RANK'S local row for it — which we can compute
-// because tof[p][*] is a deterministic function of all_ids, which every rank has.  ZERO extra comms.
+// --- combine pull plan -------------------------------------------------------------------------
+// List each producer rank and its deterministic local row for every owned token.
 __global__ void e12_pull_kernel(plan_globals_e12 g) {
     const int tau = blockIdx.x * blockDim.x + threadIdx.x;
     if (tau > g.T) return;                                 // one extra thread writes pull_ptr[T]
@@ -298,7 +268,7 @@ __global__ void e12_pull_kernel(plan_globals_e12 g) {
     int k = base;
     for (int p = 0; p < W; ++p) {
         if (!g.own[{0, 0, p * N + gtok, 0}]) continue;
-        if (k >= g.T * W) { atomicOr(&g.err[{0, 0, 0, 0}], 8); break; }   // LOUD
+        if (k >= g.T * W) { atomicOr(&g.err[{0, 0, 0, 0}], 8); break; }
         g.pull_src[{0, 0, k, 0}] = p;                               // producer rank
         g.pull_src[{0, 0, k, 1}] = g.tof[{0, 0, p * N + gtok, 0}];  // that producer's local row
         ++k;

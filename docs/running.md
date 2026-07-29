@@ -2,9 +2,8 @@
 
 ## What you need
 
-- An 8-GPU **MI350X** node (`gfx950`, device id `0x75a0`). Identify the part from the
-  **host** with `rocminfo` / `amd-smi` / `rocm-smi` — inside a container the GPU reports a
-  useless generic name.
+- An 8-GPU MI350X node (`gfx950`, device id `0x75a0`). Identify the part from the host with
+  `rocminfo` / `amd-smi` / `rocm-smi`; inside a container the GPU reports a generic name.
 - ROCm 7.2+ with `hipcc`, in a container that has the GPUs mapped.
 - A [HipKittens](https://github.com/HazyResearch/HipKittens) checkout. The GEMM includes
   `kittens.cuh`, so `HIPKITTENS_ROOT/include/kittens.cuh` must exist.
@@ -27,15 +26,14 @@ This is a pure cross-compile for gfx950 and does not need GPUs. It produces:
 | `tile_plan*.so`, `k0pf_plan*.so`, `k0pf_frozen_plan*.so` | `hipcc` + pybind | local plan construction |
 | `hsaco/k0pf_{gather,combine,quant}.hsaco` | `hipcc --genco` | prefill movement kernels loaded as prebuilt code objects |
 
-The `.hip` kernels under `kernels/decode/` and `kernels/prefill/` are **not** built here.
+The `.hip` kernels under `kernels/decode/` and `kernels/prefill/` are not built here.
 The harness JIT-compiles them at run time through MoRI's loader, which is how they pick up
 MoRI's include paths and their own device shmem globals. Every separately loaded HIP module
 carries its own `globalGpuStates`, so each must be loaded with `init_shmem=True` or
 `ShmemPtrP2p` returns 0 and you get a fault at address 0.
 
 The build script also prints the register/spill remarks from
-`-Rpass-analysis=kernel-resource-usage`. Zero spills and zero scratch in the GEMM is a
-requirement, not a nicety.
+`-Rpass-analysis=kernel-resource-usage`. The GEMM requires zero spills and zero scratch.
 
 ## Run
 
@@ -60,16 +58,16 @@ Select with `K0_ARMS` (a comma-separated list). `run_ab.sh` passes it through.
 | arm | regime | what it is |
 |---|---|---|
 | `production` | both | MoRI dispatch -> AITER `fused_moe` -> MoRI combine |
-| `k0d_mega` | decode | the headline decode path |
+| `k0d_mega` | decode | primary decode path |
 | `k0d_pd` | decode | same, with push and destination sort as two kernels |
 | `k0d_s`, `k0d_sq`, `k0d_sq_b2f`, `k0d_f` | decode | earlier pull-based decode compositions |
-| `pf4h` | prefill | the headline prefill path |
+| `pf4h` | prefill | primary prefill path |
 | `pf3_pd` | prefill | same, with the single-CTA destination sort |
 | `pf3_mega` | prefill | push and sort fused into one launch |
 | `pf_*`, `pf2_*` | prefill | earlier plan/pull-based prefill compositions |
 | `frozen_n2`, `frozen_n2r` | both | pull dispatch and combine, custom GEMM |
 | `compute_swap*` | both | keep MoRI transport, swap only the GEMM |
-| `fp_*` | both | weight-footprint diagnostics; numerics are meaningless by design |
+| `fp_*` | both | weight-footprint measurements; outputs are not used for numerical comparison |
 
 Decode arms refuse to run at prefill shape and vice versa.
 
@@ -101,8 +99,8 @@ Regime shapes, as set by `run_ab.sh`:
 | `T_LOC_MAX` | 512 | 40960 |
 | `PADMAX` | 5088 | 263136 |
 
-`T_LOC_MAX` is the number of rows a rank *receives*, bounded by `world * T` — **not** by
-`world * T * topk` — because dispatch deduplicates per destination. Those two happen to be
+`T_LOC_MAX` is the number of rows a rank receives, bounded by `world * T`, because dispatch
+deduplicates per destination. This differs from `world * T * topk`; the values happen to be
 equal only when `world == topk == 8`; use `world * T`.
 
 ## The corpus
@@ -125,8 +123,8 @@ outputs (`13`, `14`) are loaded directly into the symmetric route buffers that b
 production arm and every candidate arm consume, so a changed route cannot be hidden behind
 an out-of-graph staging copy.
 
-Captures come from a live DeepSeek-R1 serving run at TP1/DP8/EP8. A node with an MXFP4
-preview checkpoint rather than stock R1 **cannot** be a capture node.
+Captures come from a live DeepSeek-R1 serving run at TP1/DP8/EP8. Capture nodes must use
+stock R1 rather than an MXFP4 preview checkpoint.
 
 For decode, `harness/synthetic_routes.py` can generate synthetic route families as an
 alternative to a captured route (decode shape only: world 8, T 64, topk 8, E 32); set
@@ -141,17 +139,17 @@ python3 harness/summarize_k0d.py  <run-dir> [...]   # decode
 python3 harness/summarize_pf4h.py <run-dir> [...]   # prefill
 ```
 
-The headline number is the aligned `MAX(rank)` region time, reported as a paired ratio
+The primary metric is the aligned `MAX(rank)` region time, reported as a paired ratio
 against production computed per process, with the median and range across processes. Both
 warm and 1 GiB-scrubbed cold conditions are reported.
 
 ## Shared-node rules
 
-These are absolute on a shared node, and `run_ab.sh` enforces the first two:
+`run_ab.sh` enforces the first two shared-node rules:
 
 1. Check for another `mpirun`/`torchrun` before launching. Never start two 8-GPU jobs.
 2. All 8 GPUs must be idle before a timed run, or the numbers are noise.
 3. Use detached `setsid` plus `timeout` for long runs.
-4. **Never `SIGKILL` a job** — leaked GPU IPC can wedge the whole node.
+4. Do not `SIGKILL` a job; leaked GPU IPC can wedge the whole node.
 5. Never touch another tenant's container, processes or disk. Never `docker system prune`.
 6. Large data goes on the data volume, never the root filesystem.

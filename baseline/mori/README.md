@@ -19,7 +19,7 @@ The host-side Python wrapper is not part of `_jit-sources`; it is the installed
 
 With the default configuration (`kernel_type=IntraNode`, `use_external_inp_buf=True`,
 `block_num=80`) exactly two device kernels run, one per collective. There is **no separate
-barrier kernel** — the 8-GPU rendezvous is fused in-kernel, which is why it does not show up
+barrier kernel** — the 8-GPU barrier is fused in-kernel, which is why it does not show up
 as its own launch in a profile.
 
 | leg | entry symbol | body | registered | launched |
@@ -27,7 +27,7 @@ as its own launch in a profile.
 | dispatch | `EpDispatchIntraNodeKernel_bf16` | `src/ops/dispatch_combine/intranode.hpp` | `src/ops/kernels/ep_intranode.hip` | `src/ops/dispatch_combine/launch.cpp` |
 | combine | `EpCombineIntraNodeKernel_bf16_nop2p` | `src/ops/dispatch_combine/intranode.hpp` | `src/ops/kernels/ep_intranode.hip` | `src/ops/dispatch_combine/launch.cpp` |
 
-The in-kernel cross-device barrier — combine's fused rendezvous — sits near the top of
+The in-kernel cross-device barrier — combine's fused synchronization — sits near the top of
 `intranode.hpp`.
 
 ## Supporting primitives

@@ -1,34 +1,7 @@
-// ================================================================================================
-// k0pf3_mega.hip — prefill megakernel: k0pf3_qpush and k0pf3_dsort in ONE launch.
-//
-// Fused-quant plan-free source push, then a grid barrier and doorbell, then the destination sort
-// and plan build.  Two internal grid barriers replace the launch boundary; the rendezvous and
-// every memory contract match the two-kernel pair, whose headers document the phases in full.
-//
-// PHASE MAP:
-//   M0  the qpush body: warp per token — dedup, slot allocation, fused BF16 -> FP8 quantization,
-//       posted payload stores, owner-side pull_stage / pull_cnt.
-//   M1  grid barrier 1 (system fences): each CTA's thread 0 issues __threadfence_system then adds
-//       its arrival to gbar; the last arriver bumps recv_doorbell[cur] on every rank.  This is
-//       the qpush tail with gbar playing the arrival counter's role.
-//   M2  the dsort doorbell wait: every CTA's threads tid < world spin on
-//       recv_doorbell[tid] >= epoch; acquire fence; T_loc = dest_counter[0]; range check.
-//   M3  the dsort task split: CTA0 count, padded scan, nvi/sei/cursors; CTA1 CSR scan into
-//       pull_ptr; CTAs 2.. zero part[0, T_loc) and transpose sc_stage into sc_dst.
-//   M4  grid barrier 2 (device fences; scratch, nvi and pull_ptr are local to this GPU).
-//   M5  padding sentinel, atomic-cursor scatter, pull_src compaction.
-//   M6  tail: CTA0 thread 0 resets dest_counter and advances sort_count.
-//
-// CROSS-EPOCH SAFETY is identical to the two-kernel path: the downstream barrier closes the
-// forward hazard and the M2 doorbell wait closes the reverse hazard.
-//
-// GRID: launch with the qpush grid (many CTAs x 256).  The sort phases use per-CTA task splits,
-// so any grid >= 3 is correct; >= 64 is recommended so the part zero saturates store bandwidth.
-// One consequence of fusing: the M1/M2 spin phases idle the WHOLE grid during cross-rank push
-// skew, whereas the split version idles only the sort kernel.  The idle is never larger.
-//
-// pperr bits match the two-kernel pair.
-// ================================================================================================
+// Prefill quantized push and destination sort in one launch.
+// The first grid barrier releases posted payloads and signals peer doorbells. The doorbell wait
+// acquires peer writes and guards cross-epoch part reuse. A second device-scope barrier publishes
+// local plan outputs before scatter. Launch with at least three CTAs.
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -101,7 +74,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf3_mega(
 
   const unsigned int epoch = sort_count[0] + 1u;
 
-  // ================= M0: fused-quant plan-free push (== k0pf3_qpush body) =================
+  // Quantized push.
   {
     const int gw = bid * (blockDim.x >> 6) + (tid >> 6);
     const int nw = gridDim.x * (blockDim.x >> 6);
@@ -215,10 +188,10 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf3_mega(
     }
   }
 
-  // ============== M1: grid barrier #1 (system release; last arriver pokes doorbells) ======
+  // System-scope barrier and doorbell publication.
   __syncthreads();
   if (tid == 0) {
-    __threadfence_system();   // release this CTA's payload stores system-wide BEFORE arrival
+    __threadfence_system();   // Release this CTA's payload stores before arrival.
     const unsigned int old =
         __hip_atomic_fetch_add(gbar, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     if ((old % gridDim.x) == (gridDim.x - 1)) {
@@ -243,7 +216,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf3_mega(
   }
   __syncthreads();
 
-  // ================= M2: doorbell wait (== dsort P0, the cross-epoch part guard) ==========
+  // Wait for peer payloads and previous-epoch readers.
   if (tid < world) {
     volatile const unsigned int* vf = recv_doorbell;
     long long spins = 0;
@@ -253,7 +226,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf3_mega(
     }
   }
   __syncthreads();
-  __threadfence_system();   // acquire: recv payloads, dest_counter, and the part-reuse proof
+  __threadfence_system();   // Acquire payloads, counter, and the part-reuse guard.
 
   const int T_loc = (int)dest_counter[0];
   if (T_loc < 0 || T_loc > T_loc_max) {
@@ -261,7 +234,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf3_mega(
     return;
   }
 
-  // ================= M3: task-split plan work (== dsort P1) ===============================
+  // Build plan metadata and prepare live rows.
   if (bid == 0) {
     __shared__ int s_cnt[K0PM_MAXE];
     for (int i = tid; i < E; i += 256) s_cnt[i] = 0;
@@ -326,10 +299,10 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf3_mega(
     }
   }
 
-  // ============== M4: grid barrier #2 (device scope; publishes scratch/nvi/pull_ptr) ======
+  // Publish local plan outputs.
   __syncthreads();
   if (tid == 0) {
-    __threadfence();   // device release
+    __threadfence();   // Device release.
     const unsigned int old =
         __hip_atomic_fetch_add(gbar, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     const unsigned int target = (old / gridDim.x + 1u) * gridDim.x;
@@ -341,9 +314,9 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf3_mega(
     }
   }
   __syncthreads();
-  __threadfence();   // device acquire
+  __threadfence();   // Device acquire.
 
-  // ================= M5: pad sentinel + atomic-cursor scatter + CSR fill ==================
+  // Pad, scatter, and fill the combine CSR.
   {
     const int lo = cur * E, hi = lo + E;
     for (int idx = bid * 256 + tid; idx < E * 32; idx += gridDim.x * 256) {
@@ -380,7 +353,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf3_mega(
     }
   }
 
-  // ================= M6: tail — reset allocator, advance epoch ============================
+  // Reset the allocator and advance the epoch.
   __syncthreads();
   if (bid == 0 && tid == 0) {
     dest_counter[0] = 0u;

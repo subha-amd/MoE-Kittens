@@ -56,7 +56,7 @@ static __device__ __host__ const char* WcStatusString(WcStatus status) {
       /* WC_RESP_TIMEOUT_ERR*/ "response timeout error",
       /* WC_GENERAL_ERR*/ "general error",
       /* WC_TM_ERR*/ "TM error",
-      /* WC_TM_RNDV_INCOMPLETE*/ "TM software rendezvous",
+      /* WC_TM_RNDV_INCOMPLETE*/ "TM software handshake",
   };
 
   if (status < WC_SUCCESS || status > WC_TM_RNDV_INCOMPLETE) return "unknown";

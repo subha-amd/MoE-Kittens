@@ -2,10 +2,9 @@
 
 One process, 8 ranks, replayed from a captured route/weight corpus, in HIP graph mode.
 Every arm is a full region: dispatch, expert GEMM, combine.  Arms are timed in the same
-run and rotated position-balanced, so no number here is ever compared against a
-historical baseline.
+run and rotated position-balanced.
 
-The two headline arms:
+Primary arms:
 
   k0d_mega  decode.  quant -> k0d_mega (fused push dispatch + destination sort)
                      -> n2_phase1 -> n2_phase2 -> k0d_combine
@@ -15,16 +14,14 @@ The two headline arms:
 
   production  MoRI EpDispatch -> aiter.fused_moe (FP8 block-scale) -> MoRI EpCombine
 
-Other arms in this file are the intermediate compositions the two headline paths were
-built from — pull-based dispatch, split push/sort, the megakernel prefill variant,
-compute-only swaps that keep MoRI transport and change only the GEMM, and deliberately
-wrong "poison" controls whose job is to FAIL the correctness gate.  Select arms with
+Other arms include pull-based dispatch, split push/sort, the megakernel prefill variant,
+compute-only swaps that keep MoRI transport and change only the GEMM, and "poison"
+controls expected to fail the correctness gate. Select arms with
 K0_ARMS; see docs/running.md for the full list and the environment.
 
 Every arm runs the correctness gate against the captured reference on every replay,
-with a frozen tolerance (max_abs <= 0.02, rel_L2 <= 0.01, no non-finite values) that is
-never widened to make a result pass.  All candidate-unique work stays inside the timed
-graph.
+with a fixed tolerance (max_abs <= 0.02, rel_L2 <= 0.01, no non-finite values). All
+candidate-specific work stays inside the timed graph.
 
 Launch: torchrun --standalone --nnodes=1 --nproc_per_node=8 harness/region_ab.py
 """
@@ -65,7 +62,7 @@ try:
 except Exception as _e_ecs:
     _HAS_ECS = False; _ECS_ERR = repr(_e_ecs)
 try:
-    import k0_n1g_ecs_d2                           # ECS-D2 DECISIVE sibling (pair-leader D=2, per-block e reload, no drain); drop-in
+    import k0_n1g_ecs_d2                           # ECS-D2 sibling (pair-leader D=2, per-block e reload, no drain); drop-in
     _HAS_ECS_D2 = True; _ECS_D2_ERR = None
 except Exception as _e_ecs_d2:
     _HAS_ECS_D2 = False; _ECS_D2_ERR = repr(_e_ecs_d2)
@@ -73,7 +70,7 @@ import aiter
 from aiter import ActivationType, QuantType, dtypes
 from aiter.fused_moe import fused_moe, moe_sorting
 from synthetic_routes import FAMILIES as SYNTH_ROUTE_FAMILIES, generate_synthetic_route
-# ON-TARGET COMPUTE-SWAP BRIDGE (arm f): replicate EXACTLY what aiter.fused_moe does internally
+# Compute-swap bridge (arm f): reproduce aiter.fused_moe preprocessing
 # before the GEMM — moe_sorting (global E, expert_mask) then per_1x128 quant with transpose_scale=True
 # (group-major scale, mandatory for n1g) — then call n1g instead of fmoe_fp8_blockscale_g1u1.
 # get_hip_quant is what fused_moe.py imports as get_quant (see pinned source line 16).
@@ -81,19 +78,17 @@ _hipquant = aiter.get_hip_quant(QuantType.per_1x128)
 
 WORLD = int(os.environ.get("WORLD_SIZE", "1")); WR = int(os.environ.get("RANK", "0")); LR = int(os.environ.get("LOCAL_RANK", "0"))
 TOPK = 8; E = 32; E_GLOBAL = 256; K = H = 7168; INTER = 2048; NG = 56
-# Regime-shaped capacities. Defaults are the frozen DECODE values -- every decode result stays
-# byte-reproducible with no env set. Prefill overrides them via K0_* (see tile/ledger.md).
+# Regime-shaped capacities. Defaults are the decode values; prefill overrides them via K0_*.
 #   T          batch (decode 64, prefill 4096)
-#   T_LOC_MAX  rows this rank RECEIVES = WORLD*T  (decode 512, prefill 32768)
-#              Arrival-side, not send-side: gath[T_LOC_MAX,2] holds (src_rank, src_idx) per LOCAL row,
+#   T_LOC_MAX  rows this rank receives = WORLD*T (decode 512, prefill 32768)
+#              Arrival-side: gath[T_LOC_MAX,2] holds (src_rank, src_idx) per local row,
 #              fn_gather launches (T_LOC_MAX,) blocks writing local a_dst, part[:T_LOC_MAX] is n1g's
-#              output region. Bound is WORLD*T because MoRI DEDUPS per destination (L86,
-#              intranode.hpp:104-116) -- the same structural fact that makes MAXTOK >= T safe.
-#              NOTE: T*TOPK gives the same number here ONLY because WORLD == TOPK == 8. That form
-#              counts routed rows BEFORE dedup and is wrong on any other topology. Use WORLD*T.
+#              output region. The bound is WORLD*T because MoRI deduplicates per destination
+#              (intranode.hpp:104-116). T*TOPK is equal only when WORLD == TOPK == 8 and counts
+#              rows before deduplication, so use WORLD*T.
 #   PADMAX     sorted-token capacity, including up to 31 padding rows per local expert
 #   MROWS      expert-input row capacity, post-TOPK-expansion = WORLD*T*TOPK (decode 4096)
-#   MAXTOK     MoRI max_num_inp_token_per_rank -- bounds INPUT tokens/rank (= T), not routed rows
+#   MAXTOK     MoRI max_num_inp_token_per_rank; bounds input tokens/rank (= T), not routed rows
 T = int(os.environ.get("K0_T", "4096"))
 T_LOC_MAX = int(os.environ.get("K0_T_LOC_MAX", "40960"))
 if T_LOC_MAX < WORLD * T:
@@ -108,7 +103,7 @@ if PADMAX < PADMAX_SAFE or PADMAX % 32:
     )
 MROWS = T_LOC_MAX                      # expert-input row capacity follows T_LOC_MAX at prefill
 MAXTOK = int(os.environ.get("K0_MAXTOK", "4096"))        # candidate arms: MAXTOK = T (banked win, L86)
-MAXTOK_PROD = int(os.environ.get("K0_MAXTOK_PROD", "32768"))  # production arm keeps the SHIPPED value
+MAXTOK_PROD = int(os.environ.get("K0_MAXTOK_PROD", "32768"))  # production arm keeps the shipped value
 NTIMED = int(os.environ.get("K0_NTIMED", "100")); NUNTIMED = 20
 GBLK = int(os.environ.get("K0_GBLK", "256"))   # frozen gather block (best_1075x)
 CBLK = int(os.environ.get("K0_CBLK", "512"))   # frozen combine block (best_1075x)
@@ -191,20 +186,20 @@ if K0_SYNTH_ROUTE and K0_SYNTH_ROUTE not in SYNTH_ROUTE_FAMILIES:
     )
 if K0_SYNTH_WEIGHT_MODE not in ("captured", "generated"):
     raise ValueError("K0_SYNTH_WEIGHT_MODE must be captured or generated")
-# ---- ADDITIVE decode diagnostics (never part of any A/B arm or timed comparison) ----
-# K0_DB_MICRO=1: doorbell/rendezvous mechanism microbenchmark (k0d_db_micro.hip).
-# K0_MEGA_TS=1: internally timestamped k0d_mega twin replayed as a diagnostic graph.
-# K0_SKIP_TIMED_AB=1: skip ONLY the 2xNTIMED timed A/B loops (all correctness/protocol
-# gates, stress, poison, and route-swap still run before diagnostics).
+# ---- Decode measurements outside A/B timing ----
+# K0_DB_MICRO=1: doorbell/barrier mechanism microbenchmark (k0d_db_micro.hip).
+# K0_MEGA_TS=1: internally timestamped k0d_mega twin replayed as a measurement graph.
+# K0_SKIP_TIMED_AB=1: skip the 2xNTIMED timed A/B loops; correctness and protocol gates,
+# stress, poison, and route-swap still run before measurements.
 _K0_DB_MICRO = bool(int(os.environ.get("K0_DB_MICRO", "0")))
 _K0_MEGA_TS = bool(int(os.environ.get("K0_MEGA_TS", "0")))
 _K0_SKIP_TIMED = bool(int(os.environ.get("K0_SKIP_TIMED_AB", "0")))
 _K0_PF3_TS = bool(int(os.environ.get("K0_PF3_TS", "0")))
 _K0_PF3_TS_REPS = int(os.environ.get("K0_PF3_TS_REPS", "30"))
-# Diagnostic k0d modules are regime-independent: the doorbell/fabric microbenchmark measures
+# Measurement modules are regime-independent: the doorbell/fabric microbenchmark measures
 # the same hardware at prefill, and k0d_phase_marker provides the region phase stamps and the
-# s_memrealtime calibration timer for every diagnostic block. Load them standalone when a
-# prefill diagnostic is requested without any k0d decode arm.
+# s_memrealtime calibration timer for every measurement block. Load them standalone when a
+# prefill measurement is requested without a k0d decode arm.
 _K0D_STANDALONE = (not K0D_REQUESTED) and (
     _K0_DB_MICRO
     or _K0_PF3_TS
@@ -534,7 +529,7 @@ R["pf2_push_loaded"] = _PF2_PUSH_OK
 R["pf2_plan_loaded"] = _HAS_PF2_PLAN
 R["pf2_plan_import_err"] = _PF2_PLAN_ERR
 
-# ---- N2R: prebuilt hsaco with the folded rendezvous (GEMM tail fold + combine wait).
+# ---- N2R: prebuilt hsaco with the folded barrier (GEMM tail fold + combine wait).
 _N2R_OK = False
 fn_n2r_p2 = fn_combine_wait = None
 try:
@@ -702,7 +697,7 @@ sc_dst = torch.zeros((MROWS, NG), dtype=torch.float32, device=dev)
 sc_dst_pf2 = torch.zeros((MROWS, NG), dtype=torch.float32, device=dev)
 sc_stage = torch.zeros((T_LOC_MAX, NG), dtype=torch.float32, device=dev)
 stage = torch.zeros((T, H), dtype=torch.bfloat16, device=dev)
-# PUSH: device-side completion state (NEVER host-reset between replays: monotonic, graph-safe).
+# Push completion state is monotonic and is not host-reset between replays.
 emask_disp = torch.zeros((1, 1), dtype=torch.int32, device=dev)   # expected_dispatch_mask(cur)
 emask_comb = torch.zeros((1, 1), dtype=torch.int32, device=dev)   # expected_combine_mask(cur)
 gen_do = torch.zeros((1, 1), dtype=torch.int32, device=dev)       # generation counter, dispatch-only arm
@@ -754,8 +749,8 @@ if K0D_REQUESTED:
         split_quant_b2_fold=("arrival_flags", "arr_count"),
         reset_free=True,
     )
-# N2R folded-rendezvous state: SYMMETRIC epoch flags (peers increment my flags[their rank] remotely)
-# + a LOCAL cumulative grid counter.  Both MONOTONIC — zeroed ONCE at setup, never between replays.
+# N2R folded-barrier state: symmetric epoch flags (peers increment my flags[their rank] remotely)
+# A local cumulative grid counter is also monotonic; both are zeroed during setup.
 n2r_flags, n2r_flags_p = mori_t((WORLD, 1), "int32")
 n2r_flags.zero_()
 n2r_grid = torch.zeros((1,), dtype=torch.int32, device=dev)
@@ -1184,7 +1179,7 @@ def _dispatch_pf2(stream, fused=False):
             a_src_p, sc_src_p, a_dst_pf2_p, sc_stage_pf2_p,
             own.data_ptr(), tof.data_ptr(), T, WORLD, rank,
         )
-        # The standalone form deliberately pays a real fabric rendezvous before any local scale
+        # The standalone form includes a fabric barrier before any local scale
         # transpose or n2 read. It is the conservative prefill candidate.
         ms.shmem_barrier_on_stream(stream)
         fn_sc_transpose_pf2.launch(
@@ -1251,7 +1246,7 @@ def _n2_nozero(stream):
 
 def _k0d_combine(stream, folded):
     # k0d_combine's arm-2 cumulative-counter protocol has a fixed 16-block epoch denominator.
-    # Use that same 16x256 launch for both arms so A/B differs only in the rendezvous topology.
+    # Use the same 16x256 launch for both arms so A/B differs only in barrier topology.
     if folded:
         arr_flags_p, arr_count_p = k0df_arr_flags_p, k0df_arr_count.data_ptr()
         don_flags_p, don_count_p = k0df_comb_flags_p, k0df_don_count.data_ptr()
@@ -1265,7 +1260,7 @@ def _k0d_combine(stream, folded):
     )
 
 def _k0d_combine_b2f(stream, control=False):
-    # Barrier2-only fold: enable the combine-head edge-C rendezvous, but deliberately omit the
+    # Barrier2-only fold: enable the combine-head edge-C barrier, but omit the
     # combine_done tail because the split-quant arm retains standalone barrier1 on the next replay.
     if control:
         arr_flags_p, arr_count_p = (
@@ -1285,7 +1280,7 @@ def _k0d_combine_b2f(stream, control=False):
     )
 
 def k0d_s_body(stream):
-    # Arm 1: the two standalone reset-free barriers are the sole cross-rank rendezvous kernels.
+    # Arm 1: the two standalone reset-free barriers provide cross-rank synchronization.
     _k0d_fused(stream, folded=False)
     fn_k0d_barrier.launch((1,), (64,), 0, stream, k0ds_b1_flags_p, k0ds_b1_count.data_ptr(),
                            pperr.data_ptr(), SPIN, rank, WORLD)
@@ -1311,7 +1306,7 @@ def k0d_sq_body(stream):
 
 def k0d_sq_b2f_body(stream):
     # One-variable sibling of k0d_sq: identical through ordinary n2 phase2, then replace only the
-    # standalone barrier2 launch with k0d_combine's production-style edge-C head rendezvous.
+    # standalone barrier2 launch with k0d_combine's production-style edge-C head barrier.
     _k0d_fused(stream, folded=False, do_quant=False)
     _quant(stream)
     fn_k0d_barrier.launch((1,), (64,), 0, stream, k0ds_b1_flags_p, k0ds_b1_count.data_ptr(),
@@ -1414,7 +1409,7 @@ def k0d_mega_body(stream):
     _k0d_combine_pd(stream)
 
 def _k0d_mega_ts_ingress(stream):
-    # DIAGNOSTIC ONLY: identical launch to _k0d_mega_ingress plus the trailing stamp buffer.
+    # Measurement variant: _k0d_mega_ingress with a trailing stamp buffer.
     fn_k0d_mega_ts.launch(
         (16,), (256,), 0, stream,
         my_ids_p, my_wgt_p, a_src_p, sc_src_p,
@@ -1435,12 +1430,11 @@ def k0d_mega_ts_body(stream):
     _n2_nozero_pd(stream)
     _k0d_combine_pd(stream)
 
-# ===================== ON-TARGET COMPUTE-SWAP BRIDGE (arm f) =====================
-# MORI dispatch (BYTE-IDENTICAL to arm a) -> [moe_sorting + per_1x128 quant] -> n1g exact-FP8 GEMM
-# -> MORI combine (BYTE-IDENTICAL to arm a). The ONLY variable vs production is the GEMM kernel
-# (n1g replaces fmoe_fp8_blockscale_g1u1). This is the "does the COMPUTE beat production" arm.
-# Corrections baked in: (1) sort with GLOBAL E=257 + expert_mask (d_ids are global
-# expert ids); (2) stock order = SORT then QUANT; (3) transpose_scale=True group-major scale + device
+# ===================== Compute-swap bridge (arm f) =====================
+# MoRI dispatch -> [moe_sorting + per_1x128 quant] -> n1g exact-FP8 GEMM -> MoRI combine.
+# Dispatch and combine match arm a; n1g replaces fmoe_fp8_blockscale_g1u1.
+# Requirements: (1) sort with global E=257 + expert_mask (d_ids are global expert ids);
+# (2) stock order = sort then quant; (3) transpose_scale=True group-major scale + device
 # num_rows=recv; (4) use the sorter's zeroed moe_buf as n1g's output (n1g needs a zeroed live prefix).
 _bt = {}                                          # bridge-tensor retainer (graph-safety: hold refs past replay)
 GLOBAL_E = E_GLOBAL + 1                            # 257 = expert_mask.numel
@@ -1452,7 +1446,7 @@ def _bridge_sort(d_ids, d_wgt, recv):
 
 def _bridge_quant(d_a1, recv, transpose_scale=True):
     # stock per_1x128 activation quant: fp8 E4M3 bytes + group-major fp32 block scale (transpose_scale=True).
-    # transpose_scale=False is the bridge-specific POSITIVE CONTROL (token-major scale -> n1g reads wrong layout).
+    # transpose_scale=False is the control with token-major scale, which n1g reads incorrectly.
     return _hipquant(d_a1, scale=None, quant_dtype=w1_b.dtype, num_rows=recv, transpose_scale=transpose_scale)
 
 def compute_swap_body(stream, transpose_scale=True):     # (f) compute-only swap into UNCHANGED MORI transport
@@ -1469,11 +1463,10 @@ def compute_swap_body(stream, transpose_scale=True):     # (f) compute-only swap
                     d_a1=d_a1, d_ids=d_ids, d_wgt=d_wgt, recv=recv, res=res))
 
 def bridge_matched_diag(stream, transpose_scale=True):
-    # UNTIMED matched-pair diagnostic : ONE dispatch -> ONE sort+quant -> BOTH the production
-    # GEMM (fmoe_fp8_blockscale_g1u1, always correct-scale) AND n1g, on IDENTICAL sort/quant metadata, into
-    # SEPARATE zeroed buffers. This is the ONLY rigorous way to isolate n1g-vs-fmoe compute: two separate MORI
+    # Untimed matched pair: one dispatch and sort/quant feed production GEMM and n1g
+    # with identical metadata into separate zeroed buffers. Separate MoRI
     # dispatches can assign different receive-row orderings (cross-rank atomic slot alloc), so cross-dispatch
-    # row-i comparison is invalid. transpose_scale gates ONLY n1g's scale (the false-scale positive control);
+    # row-i comparison is invalid. transpose_scale changes only n1g's scale for the false-scale control;
     # fmoe always gets the correct group-major scale as the aligned reference. Outputs are clone-snapshotted
     # because op.combine returns a VIEW of the op's persistent output buffer (a later combine overwrites it).
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
@@ -1494,13 +1487,13 @@ def bridge_matched_diag(stream, transpose_scale=True):
     res_n1g  = op.combine(buf_n1g,  None, topk_ids, BLK, -1, WARP)[0][:T].clone()
     return dict(buf_fmoe=buf_fmoe, buf_n1g=buf_n1g, res_fmoe=res_fmoe, res_n1g=res_n1g, live=live)
 
-# ===================== N2 TWO-PHASE COMPUTE-SWAP ARM (arm n) =====================
-# IDENTICAL to compute_swap_body except the GEMM is k0_n2.n2_phase1 + k0_n2.n2_phase2
+# ===================== N2 two-phase compute-swap arm (arm n) =====================
+# Matches compute_swap_body except the GEMM is k0_n2.n2_phase1 + k0_n2.n2_phase2
 # (W13 -> global A2 handoff -> split-N full-K W2, write-once epilogue) instead of the
-# k0_n1g oracle. MORI dispatch/sort/quant/combine BYTE-IDENTICAL to compute_swap, so:
-#   n2/production           = THE N2 HEADLINE (does the write-once W2 close the prod gap?)
-#   n2/compute_swap(oracle) = the two-phase epilogue redesign ALONE (same-session).
-# The A2 handoff buffers are SETUP-ONLY allocations (outside the timed graph; phase 1
+# k0_n1g oracle. MoRI dispatch/sort/quant/combine match compute_swap, so:
+#   n2/production           = region comparison
+#   n2/compute_swap(oracle) = two-phase epilogue comparison in the same session
+# The A2 handoff buffers are setup allocations outside the timed graph; phase 1
 # rewrites every live row each replay, phase 2 reads only what phase 1 wrote).
 _n2_bufs = {}
 if _HAS_N2:
@@ -1537,11 +1530,9 @@ def compute_swap_n2_body(stream, transpose_scale=True):
                     d_a1_n=d_a1, d_ids_n=d_ids, res_n=res))
 
 def n2_matched_diag(stream):
-    # ONE dispatch -> ONE sort+quant -> fmoe (oracle reference) AND n2 into SEPARATE zeroed buffers.
-    # The DEFINITIVE compute-isolation gate: on IDENTICAL sort/quant metadata, n2 must equal fmoe on
-    # the LIVE prefix (only BF16 atomic-order nondeterminism), the same equality bar n1g meets.
-    # Only the n2 buffer is combined: the MoRI op is a stateful 1:1 dispatch/combine pair, while the
-    # fmoe comparison is already definitive on the row-aligned inner buffers.
+    # One dispatch and sort/quant feed fmoe and n2 into separate zeroed buffers. With identical
+    # metadata, n2 must equal fmoe on the live prefix within BF16 atomic-order tolerance.
+    # Only the n2 buffer is combined because the MoRI op is a stateful 1:1 dispatch/combine pair.
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
     sti, swt, sei, nvi, buf_fmoe = _bridge_sort(d_ids, d_wgt, recv)             # sorter's zeroed moe_buf
@@ -1562,11 +1553,10 @@ def n2_matched_diag(stream):
     res_n2 = op.combine(buf_n2, None, topk_ids, BLK, -1, WARP)[0][:T].clone()
     return dict(buf_fmoe=buf_fmoe, buf_n2=buf_n2, res_n2=res_n2, live=live)
 
-# ===================== c32 TAIL-AWARE COMPUTE-SWAP ARM (arm g) =====================
-# IDENTICAL to compute_swap_body except the GEMM kernel is k0_n1g_c32 (tail-aware BM32-M16 skip) instead of
-# the k0_n1g oracle. MORI dispatch/sort/quant/combine are BYTE-IDENTICAL to compute_swap, so:
-#   c32/production           = the c32 HEADLINE (does the tail-aware compute close the ~38us prod gap?)
-#   c32/compute_swap(oracle) = the tail-aware skip ALONE (same-session; no cross-run subtraction).
+# ===================== c32 tail-aware compute-swap arm (arm g) =====================
+# Matches compute_swap_body except that k0_n1g_c32 replaces the k0_n1g oracle.
+#   c32/production           = region comparison
+#   c32/compute_swap(oracle) = tail-aware skip comparison in the same session
 def compute_swap_c32_body(stream, transpose_scale=True):
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
@@ -1580,9 +1570,9 @@ def compute_swap_c32_body(stream, transpose_scale=True):
                     d_a1_c=d_a1, d_ids_c=d_ids, d_wgt_c=d_wgt, res_c=res))
 
 def c32_matched_diag(stream):
-    # ONE dispatch -> ONE sort+quant -> BOTH oracle n1g AND c32 n1g into SEPARATE zeroed buffers. The DEFINITIVE
-    # compute-isolation gate: on IDENTICAL sort/quant metadata, c32 must equal the oracle n1g on the LIVE prefix
-    # (c32 skips ONLY all-padding rowtiles whose output is already select/xtok<T masked to 0).
+    # One dispatch and sort/quant feed oracle n1g and c32 into separate zeroed buffers.
+    # With identical metadata, c32 must equal the oracle on the live prefix. It skips
+    # all-padding row tiles whose output is already masked to zero.
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
     sti, swt, sei, nvi, buf_oracle = _bridge_sort(d_ids, d_wgt, recv)             # sorter's zeroed moe_buf
@@ -1598,11 +1588,10 @@ def c32_matched_diag(stream):
     res_c32    = op.combine(buf_c32,    None, topk_ids, BLK, -1, WARP)[0][:T].clone()
     return dict(buf_oracle=buf_oracle, buf_c32=buf_c32, res_oracle=res_oracle, res_c32=res_c32, live=live)
 
-# ===================== AH W13 ADDRESS-HOIST COMPUTE-SWAP ARM (arm h) =====================
-# IDENTICAL to compute_swap_body except the GEMM kernel is k0_n1g_ah (W13 B-weight address hoist)
-# instead of the k0_n1g oracle. MORI dispatch/sort/quant/combine BYTE-IDENTICAL to compute_swap, so:
-#   ah/production           = THE AH HEADLINE (does the hoisted W13 address stream close the ~38us prod gap?)
-#   ah/compute_swap(oracle) = the address hoist ALONE (same-session; >=3us kill vs the oracle).
+# ===================== AH W13 address-hoist compute-swap arm (arm h) =====================
+# Matches compute_swap_body except that k0_n1g_ah replaces the k0_n1g oracle.
+#   ah/production           = region comparison
+#   ah/compute_swap(oracle) = address-hoist comparison in the same session
 def compute_swap_ah_body(stream, transpose_scale=True):
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
@@ -1614,9 +1603,9 @@ def compute_swap_ah_body(stream, transpose_scale=True):
     _ph["compute_swap_ah"] = res
 
 def ah_matched_diag(stream):
-    # ONE dispatch -> ONE sort+quant -> BOTH oracle n1g AND ah n1g into SEPARATE zeroed buffers. The DEFINITIVE
-    # compute-isolation gate: on IDENTICAL sort/quant metadata, ah must equal the oracle n1g on the LIVE prefix
-    # (the W13 address hoist streams the SAME bytes -> bit-identical MFMA inputs; only the addressing differs).
+    # One dispatch and sort/quant feed oracle n1g and ah into separate zeroed buffers. With
+    # identical metadata, ah must equal the oracle on the live prefix. The address hoist
+    # streams the same bytes, giving bit-identical MFMA inputs.
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
     sti, swt, sei, nvi, buf_oracle = _bridge_sort(d_ids, d_wgt, recv)             # sorter's zeroed moe_buf
@@ -1632,11 +1621,10 @@ def ah_matched_diag(stream):
     res_ah     = op.combine(buf_ah,     None, topk_ids, BLK, -1, WARP)[0][:T].clone()
     return dict(buf_oracle=buf_oracle, buf_ah=buf_ah, res_oracle=res_oracle, res_ah=res_ah, live=live)
 
-# ===================== ECS EXPERT-MAJOR CO-SCHEDULING COMPUTE-SWAP ARM (arm i) =====================
-# IDENTICAL to compute_swap_body except the GEMM kernel is k0_n1g_ecs (task walk = (expert,g), not
-# (block,g)) instead of the k0_n1g oracle. MORI dispatch/sort/quant/combine BYTE-IDENTICAL to compute_swap, so:
-#   ecs/production           = THE ECS HEADLINE (does removing the 1.667x DRAM weight re-read close the ~38us gap?)
-#   ecs/compute_swap(oracle) = the co-scheduling ALONE (same-session; >=3us kill vs the oracle).
+# ===================== ECS expert-major compute-swap arm (arm i) =====================
+# Matches compute_swap_body except that k0_n1g_ecs uses an (expert,g) task walk.
+#   ecs/production           = region comparison
+#   ecs/compute_swap(oracle) = co-scheduling comparison in the same session
 def compute_swap_ecs_body(stream, transpose_scale=True):
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
@@ -1648,10 +1636,9 @@ def compute_swap_ecs_body(stream, transpose_scale=True):
     _ph["compute_swap_ecs"] = res
 
 def ecs_matched_diag(stream):
-    # ONE dispatch -> ONE sort+quant -> BOTH oracle n1g AND ecs n1g into SEPARATE zeroed buffers. The DEFINITIVE
-    # compute-isolation gate: ecs reorders WHICH CTA runs each (block,g) but computes the identical per-block GEMM
-    # on identical A/weights/scales, so it must equal the oracle on the LIVE prefix (only BF16-combine atomic order
-    # differs -> near-zero, like ah).
+    # One dispatch and sort/quant feed oracle n1g and ecs into separate zeroed buffers.
+    # ECS changes CTA scheduling but computes the same per-block GEMM, so it must equal
+    # the oracle on the live prefix within BF16 combine-order tolerance.
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
     sti, swt, sei, nvi, buf_oracle = _bridge_sort(d_ids, d_wgt, recv)             # sorter's zeroed moe_buf
@@ -1667,11 +1654,10 @@ def ecs_matched_diag(stream):
     res_ecs    = op.combine(buf_ecs,    None, topk_ids, BLK, -1, WARP)[0][:T].clone()
     return dict(buf_oracle=buf_oracle, buf_ecs=buf_ecs, res_oracle=res_oracle, res_ecs=res_ecs, live=live)
 
-# ===================== ECS-D2 DECISIVE CO-SCHEDULING COMPUTE-SWAP ARM (arm j) =====================
-# The DECISIVE co-scheduling candidate : pair-leader D=2 on the oracle (block,g) walk, per-block
-# e reload (no AGPR drain, oracle-equivalent placement). MORI dispatch/sort/quant/combine BYTE-IDENTICAL, so:
-#   ecs_d2/production           = THE DECISIVE HEADLINE (does D=2 weight reuse close the ~38us prod gap?)
-#   ecs_d2/compute_swap(oracle) = the co-scheduling ALONE (same-session; >=3us kill).
+# ===================== ECS-D2 compute-swap arm (arm j) =====================
+# Pair-leader D=2 on the oracle (block,g) walk, with per-block e reload and no AGPR drain.
+#   ecs_d2/production           = region comparison
+#   ecs_d2/compute_swap(oracle) = co-scheduling comparison in the same session
 def compute_swap_ecs_d2_body(stream, transpose_scale=True):
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
@@ -1683,9 +1669,9 @@ def compute_swap_ecs_d2_body(stream, transpose_scale=True):
     _ph["compute_swap_ecs_d2"] = res
 
 def ecs_d2_matched_diag(stream):
-    # ONE dispatch -> ONE sort+quant -> BOTH oracle n1g AND ecs_d2 into SEPARATE zeroed buffers. ecs_d2 only
-    # reorders/pairs WHICH CTA runs each (block,g) but computes the identical per-block GEMM, so it must equal the
-    # oracle on the LIVE prefix (only BF16-combine atomic order differs -> near-zero).
+    # One dispatch and sort/quant feed oracle n1g and ecs_d2 into separate zeroed buffers.
+    # ECS-D2 changes CTA pairing but computes the same per-block GEMM, so it must equal
+    # the oracle on the live prefix within BF16 combine-order tolerance.
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
     sti, swt, sei, nvi, buf_oracle = _bridge_sort(d_ids, d_wgt, recv)             # sorter's zeroed moe_buf
@@ -1701,7 +1687,7 @@ def ecs_d2_matched_diag(stream):
     res_ecs_d2 = op.combine(buf_ecs_d2, None, topk_ids, BLK, -1, WARP)[0][:T].clone()
     return dict(buf_oracle=buf_oracle, buf_ecs_d2=buf_ecs_d2, res_oracle=res_oracle, res_ecs_d2=res_ecs_d2, live=live)
 
-# ---- PUSH fragments (Phase B kernels; these grids/blocks/args ARE the IMPL_SPEC ABI contract) ----
+# ---- Push fragments (Phase B kernels; grids, blocks, and arguments define the ABI) ----
 def _emask(stream):                             # device prologue: own[] -> emask_disp/emask_comb (once per replay, no host work)
     fn_emask.launch((1,), (256,), 0, stream, own.data_ptr(), emask_disp.data_ptr(), emask_comb.data_ptr(), WORLD, T, rank)
 def _epoch(stream, gen_p):                      # bump the device generation ONCE per replay (drives slot gen&1 AND the acquire compare)
@@ -1723,8 +1709,8 @@ def _combine_push(stream, gen_p, cf_p):         # PUSH: replaces barrier2 + comb
     fn_reduce.launch((T,), (256,), 0, stream, cand_out.data_ptr(), oslots_p, pull_ptr.data_ptr(),  # fp32 sum in pull_src order -> bf16 RNE
                      pull_src.data_ptr(), gen_p, T, H, WORLD, rank)
 
-# ===================== the five region bodies =====================
-# FAIRNESS FIX (problem 11): production must NOT pay a timed output copy the candidate arms avoid.
+# ===================== Region bodies =====================
+# Production does not include a timed output copy that candidate arms avoid.
 # Production reads its combine output directly from the returned tensor (its natural moe_out endpoint);
 # candidates' combine kernels already write cand_out in place. _ph stashes production's live output view.
 _ph = {}
@@ -1741,18 +1727,12 @@ def _obuf(name):
     if name in _FP_ARMS: return _ph[name]
     return cand_out
 
-# ===================== WEIGHT-FOOTPRINT DIAGNOSTIC =====================
-# THE decisive brick before any co-scheduling build. c32 (MFMA count) + ah (W13 address VALU) are RETIRED
-# graph-mode washes; the residual ~38us prod deficit is hypothesized as a 1.667x DRAM weight re-read.
-# 2x2 = {n1g oracle, aiter low-level core fmoe_fp8_blockscale_g1u1} x {real sorted_expert_ids, CACHE1 alias}.
-#   CACHE1 alias (sei -> expert 0 for every LIVE block): all tasks read the SAME expert weights => LLC-resident,
-#   no DRAM weight stream/re-read (== CACHE1 = 106.76us vs REPLAY 270us on the isolated STOCK GEMM).
-# The 4 arms share BYTE-IDENTICAL MORI dispatch -> bridge moe_sorting -> per_1x128 quant -> [FIXED sei] -> GEMM
-# -> MORI combine; the ONLY variables are (kernel) and (sei contents). Paired (real-alias) per-kernel region-wall
-# delta = that kernel's weight-DRAM cost; DoD = (real gap) - (alias gap) = the portion UNIQUE to n1g.
-# Precompute FIXED same-shaped sei_real/sei_alias buffers OUTSIDE the timed graph (NO captured
-# `where` node); alias only sei<E live blocks (padding sentinel untouched -> task-count + instruction coverage
-# preserved for BOTH kernels; sei is route-invariant/stable so a fixed snapshot == the live per-replay sort sei).
+# ===================== Weight-footprint measurement =====================
+# 2x2 = {n1g, fmoe_fp8_blockscale_g1u1} x {real sorted_expert_ids, CACHE1 alias}.
+# CACHE1 maps each live block to expert 0, keeping weights LLC-resident and avoiding the
+# DRAM weight stream. The arms share dispatch, sort, quantization, and combine; they differ
+# by GEMM kernel and sei contents. Fixed sei_real and sei_alias buffers are prepared outside
+# the timed graph. Padding sentinels remain unchanged.
 _HAS_FP = bool(int(os.environ.get("K0_FOOTPRINT", "0"))); _FP_ERR = None
 sei_real_fixed = sei_alias_fixed = None
 if _HAS_FP:
@@ -1780,8 +1760,8 @@ if _HAS_FP:
 R["has_fp"] = _HAS_FP; R["fp_err"] = _FP_ERR
 
 def _fp_body(stream, kernel, fixed_sei, key):
-    # BYTE-IDENTICAL to compute_swap_body EXCEPT (kernel) and (the FIXED sei passed to the GEMM). The live sort
-    # still runs (work parity); only its sei OUTPUT is bypassed by the precomputed fixed buffer.
+    # Matches compute_swap_body except for the kernel and fixed sei. The live sort still runs,
+    # but its sei output is replaced by the precomputed buffer.
     d_a1, d_wgt, d_scale, d_ids, recv = op.dispatch(hidden, topk_wgt, None, topk_ids, BLK, -1, WARP)
     d_a1, d_wgt, d_ids = d_a1[:M_TRIM], d_wgt[:M_TRIM], d_ids[:M_TRIM]
     sti_f, swt_f, sei_f, nvi_f, moe_buf = _bridge_sort(d_ids, d_wgt, recv)   # sei_f IGNORED (fixed_sei used instead)
@@ -1979,7 +1959,7 @@ def pf3_mega_body(stream):
     _n2_pf3_nozero(stream, st)
     _combine_pf(stream)
 
-# ---- pf3 diagnostics: timestamped twins (DIAGNOSTIC ONLY). The twin launches are identical to
+# ---- pf3 measurements: timestamped twins. The twin launches are identical to
 # the candidate launches plus the trailing stamp buffers; the buffers are module globals the
 # diagnostic block assigns before first use. ----
 _pf3_qts_buf = None
@@ -2062,7 +2042,7 @@ def full_push_body(stream):     # (e) both boundaries pushed — ZERO exposed ho
     _n1g(stream)
     _combine_push(stream, gen_fp.data_ptr(), cf_fp_p)                  # PUSH  (same gen: both boundaries, one replay)
 
-# ===================== correctness gate (frozen tolerance, never widened) =====================
+# ===================== Correctness gate with fixed tolerance =====================
 def b2f(u16): return (u16.astype(np.uint32) << 16).view(np.float32)
 def gate_against_ref(buf, ref_u16):
     c = b2f(buf.view(torch.uint16).cpu().numpy()); ref_f = b2f(ref_u16); d = c - ref_f
@@ -2070,13 +2050,13 @@ def gate_against_ref(buf, ref_u16):
                 nonfinite=int((~np.isfinite(c)).sum()), absum=float(np.abs(c).sum()))
 def gate(buf): return gate_against_ref(buf, ref)
 def ok(g): return bool(g["max_abs"] <= 0.02 and g["rel_L2"] <= 0.01 and g["nonfinite"] == 0 and g["absum"] > 0)
-def ok_fp(g): return bool(g["nonfinite"] == 0 and g["absum"] > 0)   # footprint arms: numerics meaningless BY DESIGN; finiteness only
+def ok_fp(g): return bool(g["nonfinite"] == 0 and g["absum"] > 0)   # footprint arms use a finiteness check
 def ok_arm(name, g): return ok_fp(g) if name in _FP_ARMS else ok(g)
 def _pair_gate(a, b, live=None):
-    # same-run pairwise comparison of two device bf16 tensors over the LIVE prefix [:live] (sorting only
+    # Same-run pairwise comparison of two device BF16 tensors over the live prefix [:live] (sorting only
     # guarantees valid/zero output through the live token count; the tail is unspecified). Global max_abs/rel_L2
-    # PLUS max per-row rel error with a DENOMINATOR FLOOR (#3: +1e-12 lets a ~0 ref row dominate;
-    # floor at a fraction of the max row norm). nonfinite checks BOTH operands.
+    # plus maximum per-row relative error. The denominator floor prevents a near-zero reference
+    # row from dominating. The nonfinite count checks both operands.
     x = a.detach().to(torch.float32).cpu().numpy(); y = b.detach().to(torch.float32).cpu().numpy()
     if live is not None: x, y = x[:live], y[:live]
     x = x.reshape(x.shape[0], -1); y = y.reshape(y.shape[0], -1)
@@ -2087,9 +2067,8 @@ def _pair_gate(a, b, live=None):
                 max_row_rel=float(rr.max()) if rr.size else 0.0,
                 nonfinite=int((~np.isfinite(x)).sum() + (~np.isfinite(y)).sum()))
 
-# THIS harness = the ON-TARGET compute-only swap. Arms: production (denominator), compute_swap (candidate f
-# = MORI dispatch/combine UNCHANGED + n1g exact-FP8 compute), and frozen_pull (custom-transport CONTEXT arm,
-# continuity with Stage-1's 1.092x). The push arms are a SEPARATE transport lane, excluded here.
+# Compute-only swap arms: production, compute_swap (MoRI dispatch/combine with n1g), and
+# frozen_pull (custom transport). Push arms are separate.
 _ALL = {"production": (prod_body, base_out),
         "compute_swap": (compute_swap_body, None),
         "frozen_pull": (frozen_body, cand_out)}
@@ -2107,7 +2086,7 @@ if _HAS_N2 and _HAS_PF2_PLAN and _PF2_PUSH_OK:
     _ALL["pf2_fused"] = (pf2_fused_body, None)
     if _N2R_OK:
         _ALL["pf2_n2r"] = (pf2_n2r_body, None)
-if _HAS_N2 and _N2R_OK: _ALL["frozen_n2r"] = (frozen_n2r_body, None)   # folded-rendezvous region arm
+if _HAS_N2 and _N2R_OK: _ALL["frozen_n2r"] = (frozen_n2r_body, None)   # folded-barrier region arm
 if PF3_REQUESTED and not _HAS_N2:
     raise RuntimeError(f"PF3 prefill arms require k0_n2: {_N2_ERR}")
 if PF3_REQUESTED and PF3_OK and _HAS_N2:
@@ -2136,7 +2115,7 @@ R["k0d"]["arms_registered"] = [
 if _HAS_C32: _ALL["compute_swap_c32"] = (compute_swap_c32_body, None)   # c32 tail-aware arm (same-session A/B)
 if _HAS_AH:  _ALL["compute_swap_ah"]  = (compute_swap_ah_body, None)    # AH W13 address-hoist arm (same-session A/B)
 if _HAS_ECS: _ALL["compute_swap_ecs"] = (compute_swap_ecs_body, None)   # ECS full-run co-scheduling arm (lower-bound; AGPR drain)
-if _HAS_ECS_D2: _ALL["compute_swap_ecs_d2"] = (compute_swap_ecs_d2_body, None)   # ECS-D2 DECISIVE co-scheduling arm (same-session A/B)
+if _HAS_ECS_D2: _ALL["compute_swap_ecs_d2"] = (compute_swap_ecs_d2_body, None)   # ECS-D2 co-scheduling arm
 if _HAS_FP:                                                             # weight-footprint 2x2 
     _ALL["fp_n1g_real"]    = (fp_n1g_real_body, None)
     _ALL["fp_n1g_alias"]   = (fp_n1g_alias_body, None)
@@ -2147,8 +2126,8 @@ R["has_n2"] = _HAS_N2; R["n2_import_err"] = _N2_ERR
 R["has_ah"] = _HAS_AH; R["ah_import_err"] = _AH_ERR
 R["has_ecs"] = _HAS_ECS; R["ecs_import_err"] = _ECS_ERR
 R["has_ecs_d2"] = _HAS_ECS_D2; R["ecs_d2_import_err"] = _ECS_D2_ERR
-# DEFAULT = genuine 2-arm headline: custom-transport frozen_pull is a SEPARATE context run
-# (K0_ARMS=production,compute_swap,frozen_pull) so its cache/collective footprint never perturbs the A/F number.
+# By default, custom-transport frozen_pull runs separately so its cache and collective
+# footprint does not affect the production/compute_swap comparison.
 _REQUESTED = [nm for nm in os.environ.get("K0_ARMS", "production,frozen_n2,frozen_n2r").split(",") if nm]
 _UNKNOWN = [nm for nm in _REQUESTED if nm not in _ALL]
 if _UNKNOWN:
@@ -2663,7 +2642,7 @@ if int(os.environ.get("K0_STAGE_PROFILE", "1")):
                   flush=True)
 
     # Decode-only attribution for the two k0d bodies.  This is deliberately eager/event based:
-    # it preserves the real cross-rank rendezvous and the exact n2 calls while exposing each
+    # it preserves cross-rank synchronization and the exact n2 calls while exposing each
     # kernel's contribution.  Headline A/B timing below remains graph replay and is unaffected.
     if _K0D_SELECTED:
         _k0d_stage_specs = {}
@@ -3029,7 +3008,7 @@ if "compute_swap" in R["arms"]:
     hbarrier()
     # production SNAPSHOT (op.combine returns a VIEW of the persistent output buffer -> clone before reuse).
     torch.cuda.synchronize(); prod_body(sp()); torch.cuda.synchronize(); prod_snap = _ph["prod"].clone()
-    # matched-pair: fmoe (oracle, correct scale) + n1g on IDENTICAL sort/quant, one dispatch.
+    # Matched pair: fmoe (oracle, correct scale) and n1g share one dispatch and sort/quant.
     hbarrier(); mp = bridge_matched_diag(sp(), transpose_scale=True); LIVE = mp["live"]; R["live_tokens"] = LIVE
     R["bridge_oracle"]      = gate(mp["res_fmoe"]); R["bridge_oracle"]["pass"] = ok(R["bridge_oracle"])   # fmoe(my twin) vs corpus
     R["compute_swap_final"] = gate(mp["res_n1g"]);  R["compute_swap_final"]["pass"] = ok(R["compute_swap_final"])  # n1g vs corpus
@@ -3039,7 +3018,7 @@ if "compute_swap" in R["arms"]:
     _op = R["oracle_vs_prod"]; _in = R["inner_n1g_vs_fmoe"]
     R["oracle_vs_prod"]["pass"]    = bool(_op["max_abs"] <= 0.02 and _op["rel_L2"] <= 0.01 and _op["nonfinite"] == 0)
     R["inner_n1g_vs_fmoe"]["pass"] = bool(_in["max_abs"] <= 0.02 and _in["rel_L2"] <= 0.01 and _in["nonfinite"] == 0)
-    # false-scale POSITIVE CONTROL: n1g fed token-major scale MUST fail BOTH the inner (vs correct fmoe) and final gate.
+    # False-scale control: n1g receives token-major scale and must fail the inner and final gates.
     hbarrier(); mpc = bridge_matched_diag(sp(), transpose_scale=False)
     _ci = _pair_gate(mpc["buf_n1g"], mpc["buf_fmoe"], live=mpc["live"])
     R["bridge_control_inner"] = _ci; R["bridge_control_final"] = gate(mpc["res_n1g"])
@@ -3064,7 +3043,7 @@ if "compute_swap" in R["arms"]:
               f"-> bridge_control_fails={R['bridge_control_fails']} (MUST be True) | bridge_val_ok={bridge_val_ok}", flush=True)
     hbarrier()
 
-# ---- n2 compute-isolation gate: n2 inner == fmoe inner on IDENTICAL sort/quant (definitive) ----
+# ---- n2 compute-isolation gate: n2 inner == fmoe inner with identical sort/quant ----
 R["n2_gate_ok"] = True
 if "compute_swap_n2" in R["arms"] and _HAS_N2:
     hbarrier(); mn2 = n2_matched_diag(sp())
@@ -3079,7 +3058,7 @@ if "compute_swap_n2" in R["arms"] and _HAS_N2:
               f"pass={R['n2_inner_vs_fmoe']['pass']} | n2_gate_ok={R['n2_gate_ok']}", flush=True)
     hbarrier()
 
-# ---- c32 compute-isolation gate: c32 inner == oracle n1g inner on IDENTICAL sort/quant (definitive) ----
+# ---- c32 compute-isolation gate: c32 inner == oracle n1g inner with identical sort/quant ----
 R["c32_gate_ok"] = True
 if "compute_swap_c32" in R["arms"] and _HAS_C32:
     hbarrier(); mc = c32_matched_diag(sp())
@@ -3095,8 +3074,8 @@ if "compute_swap_c32" in R["arms"] and _HAS_C32:
               f"pass={R['c32_inner_vs_oracle']['pass']} | c32_gate_ok={R['c32_gate_ok']}", flush=True)
     hbarrier()
 
-# ---- AH compute-isolation gate: ah inner == oracle n1g inner on IDENTICAL sort/quant (definitive) ----
-# The W13 address hoist streams the SAME bytes as the oracle, so its MFMA inputs are BIT-IDENTICAL; the
+# ---- AH compute-isolation gate: ah inner == oracle n1g inner with identical sort/quant ----
+# The W13 address hoist streams the same bytes as the oracle, so its MFMA inputs are bit-identical; the
 # inner pair-gate should be near-zero (only BF16-combine nondeterminism), a STRONGER equality than c32's skip.
 R["ah_gate_ok"] = True
 if "compute_swap_ah" in R["arms"] and _HAS_AH:
@@ -3113,7 +3092,7 @@ if "compute_swap_ah" in R["arms"] and _HAS_AH:
               f"pass={R['ah_inner_vs_oracle']['pass']} | ah_gate_ok={R['ah_gate_ok']}", flush=True)
     hbarrier()
 
-# ---- ECS compute-isolation gate: ecs inner == oracle n1g inner on IDENTICAL sort/quant (definitive) ----
+# ---- ECS compute-isolation gate: ecs inner == oracle n1g inner with identical sort/quant ----
 # ecs only REORDERS which CTA runs each (block,g); the per-block GEMM math is byte-for-byte the oracle's, so the
 # inner pair-gate should be near-zero (only BF16-combine atomic-order nondeterminism), the same strong equality ah has.
 R["ecs_gate_ok"] = True
@@ -3131,7 +3110,7 @@ if "compute_swap_ecs" in R["arms"] and _HAS_ECS:
               f"pass={R['ecs_inner_vs_oracle']['pass']} | ecs_gate_ok={R['ecs_gate_ok']}", flush=True)
     hbarrier()
 
-# ---- ECS-D2 compute-isolation gate: ecs_d2 inner == oracle n1g inner on IDENTICAL sort/quant (definitive) ----
+# ---- ECS-D2 compute-isolation gate: ecs_d2 inner == oracle n1g inner with identical sort/quant ----
 R["ecs_d2_gate_ok"] = True
 if "compute_swap_ecs_d2" in R["arms"] and _HAS_ECS_D2:
     hbarrier(); md2 = ecs_d2_matched_diag(sp())
@@ -3147,7 +3126,7 @@ if "compute_swap_ecs_d2" in R["arms"] and _HAS_ECS_D2:
               f"pass={R['ecs_d2_inner_vs_oracle']['pass']} | ecs_d2_gate_ok={R['ecs_d2_gate_ok']}", flush=True)
     hbarrier()
 
-# positive control: the frozen combine's store-over-a-peer bug MUST fail the gate (proves the gate can fail).
+# The frozen combine's store-over-a-peer control must fail the gate.
 hbarrier(); cand_out.zero_()
 # e004: n1g hardcodes a [4096,3584] BF16 view and rejects prefill shapes. The control tests the
 # BUGGY COMBINE, not the GEMM, so n2 serves identically as the partial producer.
@@ -3198,7 +3177,7 @@ R["graph_capture_ok"] = cap_ok
 # Opt-in graph-resident phase profiler for the current decode push arms. Timing events are captured
 # as graph nodes, so the intervals exclude Python launch gaps and retain the same kernel scheduling,
 # cross-rank waits, and stream topology as the real regional graph. The extra event nodes make this
-# diagnostic-only; the ordinary uninstrumented graphs remain the headline timing source.
+# This measurement is instrumented; primary timings use the uninstrumented graphs.
 if (
     cap_ok
     and int(os.environ.get("K0_DECODE_GRAPH_EVENT_PROFILE", "0"))
@@ -3295,7 +3274,7 @@ if (
             ).strip()
         )
 
-    # Capture the pure owner-pull body separately, with all edge-C rendezvous pointers null.
+    # Capture the pure owner-pull body separately, with all edge-C barrier pointers null.
     _plain_events = [torch.cuda.Event(True), torch.cuda.Event(True)]
     _plain_graph = torch.cuda.CUDAGraph()
     _plain_stream = torch.cuda.Stream()
@@ -3785,9 +3764,9 @@ if (
     torch.cuda.synchronize()
     hbarrier()
 
-# ===================== graph correctness gate on every arm (THE gate that makes the number real) =====================
-# candidate output vs FRESH same-run stock, frozen tolerance, never widened. This + control_fails +
-# pperr==0 is the timing gate. Repeated and interleaved graph stress below are also hard gates.
+# ===================== Graph correctness gate for every arm =====================
+# Compare candidate output with same-run production using fixed tolerances. The timing gate
+# also requires control_fails, pperr==0, and the repeated and interleaved graph checks below.
 gate_ok = bool(
     cap_ok
     and R["eager_all_pass"]
@@ -3867,7 +3846,7 @@ if cap_ok and _PF3_SELECTED:
     pperr.zero_(); torch.cuda.synchronize(); hbarrier()
 
 # The corpus route is static, so normal graph correctness cannot prove that the pybind plan launch
-# was actually captured. Poison its decisive device outputs and require each custom graph to rebuild
+# was captured. Poison its device outputs and require each custom graph to rebuild
 # them during replay. This catches a default-stream launch silently falling outside capture.
 R["plan_capture"] = {}
 if cap_ok:
@@ -3988,7 +3967,7 @@ if cap_ok and _pf2_epoch_arms and pf2_poison_control_graph is not None:
     hbarrier()
 
 # ===================== k0d 16-replay poison / plan / partial epoch gate =====================
-# Poison all cross-rank ingress payload, decisive plan outputs, and the live symmetric partial sink.
+# Poison all cross-rank ingress payload, plan outputs, and the live symmetric partial sink.
 # The captured k0d graph must reconstruct every one.  Its paired no-quant downstream graph uses
 # k0d gather+zero/n2/k0d combine but deliberately omits origin quant, so it must fail every epoch.
 R["k0d_epoch_ok"] = True
@@ -4547,16 +4526,14 @@ if _route_swap_any_selected:
                 print(f"[PF4H GATE] distinct-route replay pass={R['pf4h_route_swap_ok']} "
                       f"safe_direction={k0d_route['collective_safe_direction']}", flush=True)
 
-# ===================== n2r two-sided EPOCH gate (instrument — runs AFTER capture) =====================
-# (a) EPOCH-POSITIVE: 16 poisoned replays of each selected n2r graph. k0pf2 arms already run this
+# ===================== n2r two-sided epoch gate (runs after capture) =====================
+# (a) Positive path: 16 poisoned replays of each selected n2r graph. k0pf2 arms already run this
 #     positive gate in the k0pf2 block above; frozen_n2r runs it here. Before each replay poison the
 #     cross-rank SOURCE buffers (a_src/sc_src <- 0x7E / NaN) and the live symmetric partial sink.
 #     A racy arm reads the finite sentinel/zero -> rel_L2 explodes; a correct arm reads fresh data.
-# (b) EPOCH-CONTROL (fail-closed, DEDICATED never-signaled buffers): grid_ctrl = 256 (epoch 1) with
-#     flags_ctrl = 0 -> the combine_wait spin can NEVER be satisfied -> bounded spin times out ->
-#     pperr != 0 MUST be observed. The timeout path records the error and then continues, so the
-#     already-valid partial payload may still produce a numerically valid output; pperr is the
-#     deterministic non-vacuity signal.
+# (b) Fail-closed control with dedicated, unsignaled buffers: grid_ctrl = 256 (epoch 1) with
+#     flags_ctrl = 0. The combine_wait spin times out and must set pperr. The existing partial
+#     payload may still produce valid output, so pperr confirms that the timeout occurred.
 R["n2r_epoch_ok"] = True
 _selected_n2r = [nm for nm in ("frozen_n2r", "pf2_n2r") if nm in R["arms"]]
 if cap_ok and _selected_n2r and _N2R_OK:
@@ -4564,7 +4541,7 @@ if cap_ok and _selected_n2r and _N2R_OK:
         _ep_ok = True
         for rep in range(16):
             a_src_u8.fill_(0x7E); sc_src.fill_(float("nan"))
-            # Poison the LIVE symmetric partial rows, not the empty capacity tail.
+            # Poison the live symmetric partial rows, not the empty capacity tail.
             # The graph clears/rebuilds its own local rows. A premature remote
             # combine therefore observes either this finite sentinel or the
             # graph's intermediate zeroes instead of a prior replay's valid data.
@@ -4685,8 +4662,8 @@ gate_ok = bool(
 R["timing_gate_ok"] = gate_ok
 if rank == 0: print(f"[MARK] FINAL timing_gate_ok={gate_ok} (cap={cap_ok} bridge_val={bridge_val_ok} xstress={xstress_pass} c32={R.get('c32_gate_ok')} ah={R.get('ah_gate_ok')} n2={R.get('n2_gate_ok')})", flush=True)
 
-# ===================== k0d decode diagnostics (ADDITIVE; run after every hard gate passes) =====================
-# Neither diagnostic is an A/B arm. k0d_db_micro owns its flag slices and never touches arm
+# ===================== k0d decode measurements after gates =====================
+# Neither measurement is an A/B arm. k0d_db_micro owns its flag slices and never touches arm
 # protocol state; k0d_mega_ts advances the shared pd/mega monotonic state only by complete
 # epochs, exactly like one extra replay of the k0d_mega arm. Both fail closed on pperr.
 if (
@@ -4906,7 +4883,7 @@ if gate_ok and not _K0_SKIP_TIMED:
     # ---- cache-conditioning read-sweep scrub graph : a deterministic FULL READ of a disjoint
     #      buffer >> MALL/L2, with a tiny device sink. NOT a memset (a memset may take a cache-bypassing
     #      write path and fail to evict). Replayed before EACH timed A/F so back-to-back same-layer L2/MALL
-    #      residue cannot flatter one arm. Scrub is OUTSIDE the event-record window -> never in the number.
+    #      residue cannot favor one arm. Scrubbing is outside the event-record window.
     SCRUB_MB = int(os.environ.get("K0_SCRUB_MB", "1024"))
     scrub_buf = torch.empty(SCRUB_MB * 1024 * 1024 // 4, dtype=torch.float32, device=dev).uniform_(-1.0, 1.0)
     scrub_sink = torch.zeros(1, dtype=torch.float32, device=dev)
@@ -4998,28 +4975,28 @@ if gate_ok and not _K0_SKIP_TIMED:
         if "k0d_sq_b2f" in names and "k0d_sq" in names:
             RT["k0d_sq_b2f/k0d_sq"] = ratio(aligned["k0d_sq_b2f"], aligned["k0d_sq"])
         if "pf4h" in names and "pf3_pd" in names:
-            # pf4h differs from pf3_pd ONLY in the destination sort's count phase, so the
+            # pf4h differs from pf3_pd only in the destination sort's count phase, so the
             # per-iteration paired ratio is the isolated hierarchical-histogram delta.
             RT["pf4h/pf3_pd"] = ratio(aligned["pf4h"], aligned["pf3_pd"])
-        if "frozen_n2r" in names: RT["frozen_n2r/production"] = ratio(aligned["frozen_n2r"], prod)   # THE N2R REGION HEADLINE
+        if "frozen_n2r" in names: RT["frozen_n2r/production"] = ratio(aligned["frozen_n2r"], prod)   # N2R region ratio
         if "frozen_n2r" in names and "frozen_n2" in names:
             RT["frozen_n2r/frozen_n2"] = ratio(aligned["frozen_n2r"], aligned["frozen_n2"])
         if "frozen_n2r" in names and "frozen_pull" in names:
             RT["frozen_n2r/frozen_pull"] = ratio(aligned["frozen_n2r"], aligned["frozen_pull"])   # n2 GEMM + barrier fold vs our old region
-        if "compute_swap_n2" in names: RT["compute_swap_n2/production"] = ratio(aligned["compute_swap_n2"], prod)   # THE N2 HEADLINE
+        if "compute_swap_n2" in names: RT["compute_swap_n2/production"] = ratio(aligned["compute_swap_n2"], prod)   # N2 region ratio
         if "compute_swap_n2" in names and "compute_swap" in names:
             RT["compute_swap_n2/compute_swap"] = ratio(aligned["compute_swap_n2"], aligned["compute_swap"])   # two-phase redesign ALONE (same-session)
-        if "compute_swap" in names: RT["compute_swap/production"] = ratio(aligned["compute_swap"], prod)   # oracle n1g headline / reproduction check
-        if "compute_swap_c32" in names: RT["compute_swap_c32/production"] = ratio(aligned["compute_swap_c32"], prod)   # THE c32 HEADLINE
+        if "compute_swap" in names: RT["compute_swap/production"] = ratio(aligned["compute_swap"], prod)   # oracle n1g ratio
+        if "compute_swap_c32" in names: RT["compute_swap_c32/production"] = ratio(aligned["compute_swap_c32"], prod)   # c32 region ratio
         if "compute_swap_c32" in names and "compute_swap" in names:
             RT["compute_swap_c32/compute_swap"] = ratio(aligned["compute_swap_c32"], aligned["compute_swap"])   # tail-aware skip ALONE (same-session)
-        if "compute_swap_ah" in names: RT["compute_swap_ah/production"] = ratio(aligned["compute_swap_ah"], prod)   # THE AH HEADLINE (does the W13 addr hoist close the gap?)
+        if "compute_swap_ah" in names: RT["compute_swap_ah/production"] = ratio(aligned["compute_swap_ah"], prod)   # AH region ratio
         if "compute_swap_ah" in names and "compute_swap" in names:
             RT["compute_swap_ah/compute_swap"] = ratio(aligned["compute_swap_ah"], aligned["compute_swap"])   # W13 address hoist ALONE (same-session; >=3us kill)
-        if "compute_swap_ecs" in names: RT["compute_swap_ecs/production"] = ratio(aligned["compute_swap_ecs"], prod)   # THE ECS HEADLINE (does removing the DRAM re-read close the gap?)
+        if "compute_swap_ecs" in names: RT["compute_swap_ecs/production"] = ratio(aligned["compute_swap_ecs"], prod)   # ECS region ratio
         if "compute_swap_ecs" in names and "compute_swap" in names:
             RT["compute_swap_ecs/compute_swap"] = ratio(aligned["compute_swap_ecs"], aligned["compute_swap"])   # expert-major co-scheduling ALONE (same-session; >=3us kill)
-        if "compute_swap_ecs_d2" in names: RT["compute_swap_ecs_d2/production"] = ratio(aligned["compute_swap_ecs_d2"], prod)   # THE DECISIVE ECS-D2 HEADLINE
+        if "compute_swap_ecs_d2" in names: RT["compute_swap_ecs_d2/production"] = ratio(aligned["compute_swap_ecs_d2"], prod)   # ECS-D2 region ratio
         if "compute_swap_ecs_d2" in names and "compute_swap" in names:
             RT["compute_swap_ecs_d2/compute_swap"] = ratio(aligned["compute_swap_ecs_d2"], aligned["compute_swap"])   # D=2 co-scheduling ALONE (same-session; >=3us kill)
         if "frozen_pull" in names:  RT["frozen_pull/production"]  = ratio(aligned["frozen_pull"], prod)    # Stage-1 context
@@ -5036,11 +5013,11 @@ if gate_ok and not _K0_SKIP_TIMED:
             R[f"delta_n2r_us_{tag}"] = dict(p5=p(dur, 5), p50=p(dur, 50), p95=p(dur, 95), mean=float(np.mean(dur)),
                                             n_faster=int((dur > 0).sum()), n=int(dur.size))
             if "frozen_n2" in names:
-                dnr = aligned["frozen_n2"] - aligned["frozen_n2r"]   # >0 => the fold is FASTER than standalone rendezvous
+                dnr = aligned["frozen_n2"] - aligned["frozen_n2r"]   # >0 means the fold is faster than the standalone barrier
                 R[f"delta_n2r_vs_n2_us_{tag}"] = dict(p5=p(dnr, 5), p50=p(dnr, 50), p95=p(dnr, 95), mean=float(np.mean(dnr)),
                                                       n_faster=int((dnr > 0).sum()), n=int(dnr.size))
         if "compute_swap_n2" in names:
-            dun = prod - aligned["compute_swap_n2"]   # >0 => n2 FASTER than production (the headline)
+            dun = prod - aligned["compute_swap_n2"]   # >0 means n2 is faster than production
             R[f"delta_n2_us_{tag}"] = dict(p5=p(dun, 5), p50=p(dun, 50), p95=p(dun, 95), mean=float(np.mean(dun)),
                                            n_faster=int((dun > 0).sum()), n=int(dun.size))
             if "compute_swap" in names:

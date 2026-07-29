@@ -1,38 +1,8 @@
-// ===========================================================================
-// n2_phase2.cpp — expert GEMM, phase 2 of 2: W2 as split-N full-K, so every
-// output element is written exactly once.
-//
-// A split-K W2 divides K = 2048 into 8 chunks whose BF16 partials collide in
-// global_atomic_pk_add_bf16, producing roughly 8x the minimum atomic write
-// traffic.  Here the task is (sorted block b, output n-chunk nc in [0, 16)):
-// one CTA owns a [32 x 448] output tile and reduces ALL 16 K128 groups of the
-// intermediate activation in registers (56 VGPRs of accumulators per lane),
-// then writes the tile once.  The only atomics left are the intrinsic
-// cross-block top-k collisions.
-//
-// Structure per task:
-//   * A2, the phase-1 handoff ([rowcap x 2048] FP8), streams through the same
-//     CTA-shared, XOR-swizzled, double-buffered LDS tile idiom the W13 phase
-//     uses for its A gather: memory order, 8 fully-used cache lines per
-//     instruction, descriptor bounded to num_records = nvi[0] * 2048.
-//   * W2 streams as preshuffled fragments straight from global with no LDS,
-//     7 N16 tiles per wave, double-buffered, AGPR-staged by the backend under
-//     -mllvm -amdgpu-mfma-vgpr-form=1.
-//   * Per K128 group kb: a fresh FP32 partial per MFMA (srcC = 0), folded with
-//     s = fc2_scale[e, ng(tile), kb] * DQ2[row, kb], which is the dequant
-//     applied before the write.
-//   * Epilogue: multiply by sorted_weights, pack to BF16, run the wave-local
-//     XOR-swizzled LDS transpose (2 cache lines per atomic), then
-//     global_atomic_pk_add_bf16 under an `xtok < T` exec mask.  The atomic
-//     itself is unbounded, so that mask is a memory-safety requirement.
-//
-// XCD discipline: the mapping nc -> XCD (nc mod 8) is stable across blocks
-// (16 mod 8 == 0), so every block of an expert re-reads its W2 slices through
-// the same XCD's L2 and the HBM read set stays disjoint.
-//
-// Pipeline: K-loop over 16 K128 groups, unroll-2, 15 loads in flight (14 W2
-// plus 1 A2), and no vmcnt(0) inside the loop.
-// ===========================================================================
+// Phase 2 of the two-phase expert GEMM: split-N full-K W2.
+// Each task owns a 32x448 output tile and reduces all 16 K128 groups. A2 uses a bounded,
+// double-buffered LDS tile; W2 streams from global memory. The epilogue multiplies route weights,
+// packs BF16, transposes wave-locally, and masks unbounded output atomics with token<T.
+// Mapping n-chunk modulo 8 keeps an expert's W2 slices on a stable XCD.
 
 #include "kittens.cuh"
 #include "n2_fused_moe.hpp"
@@ -125,15 +95,14 @@ __device__ __forceinline__ void lds_cta_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-// The write-once epilogue, JMAX N16 tiles at a time (n1g's wave-local
-// transpose idiom, unchanged in form; JMAX is compile-time so the loops unroll).
+// Write JMAX N16 tiles through a wave-local transpose.
 template <int JMAX>
 __device__ __forceinline__ void epilogue_write(
     std::uint32_t (&xp)[kBlockM][32], racc (&acc)[JMAX][2],
     const float (&sw2)[2], const bool (&lv2)[2], const int (&xtok)[16], int T,
     int q, int r, int rowh, int dcol, std::size_t col_base,
     __hip_bfloat16* __restrict__ OUT) {
-  // PHASE 1 (write, MFMA layout): lane 16q+r holds sorted rows {r, 16+r}.
+  // Write MFMA layout; lane 16q+r holds rows {r,16+r}.
 #pragma unroll
   for (int m = 0; m < 2; ++m) {
     const int row = 16 * m + r;
@@ -154,14 +123,12 @@ __device__ __forceinline__ void epilogue_write(
       *reinterpret_cast<uint2*>(&xp[row][phys]) = packed;
     }
   }
-  // The transpose is WAVE-LOCAL, so this RAW needs NO CTA barrier.
+  // The transpose is wave-local; no CTA barrier is needed.
   __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
   __builtin_amdgcn_s_waitcnt(0xc07f);  // lgkmcnt(0); vmcnt/expcnt free
   __builtin_amdgcn_wave_barrier();
 
-  // PHASE 2 (read, ATOMIC layout): 2 cache lines per atomic.  The output
-  // atomic is UNBOUNDED: `xtok[i] < T` is uniform across each 32-lane half, so
-  // a padding row's half-wave is EXEC-masked off and forms no address at all.
+  // Read atomic layout. token<T prevents address formation for padding rows.
   if (dcol < 8 * JMAX) {
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
@@ -179,9 +146,7 @@ __device__ __forceinline__ void epilogue_write(
   __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "wavefront");
 }
 
-// ===========================================================================
-// PHASE 2: split-N full-K W2, write-once epilogue
-// ===========================================================================
+// Split-N full-K W2.
 __global__ __launch_bounds__(kThreads, 1) void n2_phase2_kernel(
     const std::uint8_t* __restrict__ A2q,       // [rowcap, 2048] FP8 (phase 1)
     const float* __restrict__ DQ2,              // [rowcap, 16] FP32 (phase 1)
@@ -320,7 +285,7 @@ __global__ __launch_bounds__(kThreads, 1) void n2_phase2_kernel(
       }
     };
 
-    // ---- the pipeline: K-loop over the FULL intermediate dim. ---------------
+    // K loop over the full intermediate dimension.
     load_a2(0, 0);
     load_a2(1, 1);
     load_w2(0, 0);
@@ -359,9 +324,7 @@ __global__ __launch_bounds__(kThreads, 1) void n2_phase2_kernel(
       lds_cta_barrier();
     }
 
-    // =======================================================================
-    // WRITE-ONCE EPILOGUE: the [32 x 448] tile, two passes (4 + 3 tiles).
-    // =======================================================================
+    // Write the 32x448 tile in two passes.
     const int tok2[2] = {tok_lds[r], tok_lds[16 + r]};
     const float sw2[2] = {w_lds[r], w_lds[16 + r]};
     const bool lv2[2] = {tok2[0] < T, tok2[1] < T};

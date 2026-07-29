@@ -1,26 +1,7 @@
-// ================================================================================================
-// k0d_barrier.hip — a minimal cross-rank stream barrier, used at decode in place of
-// mori::shmem::shmem_barrier_on_stream.
-//
-// MoRI's on-stream barrier is a centralized two-phase coordinator rendezvous: rank 0 waits for
-// world-1 arrival puts and then serializes the same number of notify puts, each wrapped in a
-// quiet plus a system fence, and the non-leaders pay a second round trip and a flag reset.  This
-// kernel keeps the same all-arrive / all-release semantics but pays it with one parallel release
-// poke per peer, a local flag spin, and monotonic reset-free epochs.
-//
-// CONSTRUCTION — one block of 64 threads per rank; thread 0:
-//     epoch = ++count[0]            local, monotonic, never reset; ranks agree by stream order
-//     __threadfence_system()        release: all of this rank's prior writes, system-wide
-//     for pe != cur: remote atomicAdd(flags[cur] on pe, +1, SYSTEM)   arrival pokes, in parallel
-//     local atomicAdd(flags[cur], +1)                                 self arrival, same counter
-//   threads 0..world-1: bounded volatile spin on local flags[tid] >= epoch (fail-closed to pperr)
-//   __syncthreads, then __threadfence_system as the acquire.
-//
-// flags is SYMMETRIC [world], zeroed once at setup and never reset (monotonic per-source
-// arrivals).  count is LOCAL [1], also zeroed once.  Each barrier instance needs its own
-// (flags, count) pair.  Epoch equality across ranks holds because every rank's graph calls this
-// kernel at the same points in the same order.
-// ================================================================================================
+// Cross-rank stream barrier using monotonic per-source flags.
+// Thread 0 releases prior writes and signals every rank. Threads 0..world-1 wait on one local flag
+// each, then a system fence acquires peer writes. flags and count are zeroed once and never reset.
+// Each barrier instance requires its own pair, and ranks must invoke instances in the same order.
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES

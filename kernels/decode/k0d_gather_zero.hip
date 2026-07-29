@@ -1,20 +1,5 @@
-// ================================================================================================
-// k0d_gather_zero.hip — pull-side gather with the partial-buffer clear folded in.
-//
-// A standalone part.zero_() costs a launch plus a few microseconds even when the buffer is small,
-// and at prefill it clears the full capacity rather than only the live rows.  The gather already
-// visits every live row t < T_loc, so the [0, T_loc) clear rides along in the same warp visit.
-// Zeroed rows are exactly what the GEMM's accumulating phase-2 epilogue requires; rows >= T_loc
-// are never read.
-//
-// Semantics are the plain gather (same direct-P2P pull, same group-major scale scatter, same
-// invalid-row zero fill) plus part[t][:] = 0 in BF16 for every t < T_loc.  The part write is a
-// local 16 B/lane store stream of 14 x 1 KB warp chunks issued after the row pull, so it is
-// nearly free next to the fabric pull.
-//
-// Argument order is the plain gather's with `part` appended.  Any grid is correct (grid-stride);
-// decode uses (128, 256) and prefill (2048, 256).
-// ================================================================================================
+// Pull-side gather that also clears part[0,T_loc), as required by the accumulating GEMM epilogue.
+// Scales are transposed to group-major order and invalid rows are zero-filled.
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -33,7 +18,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_gather_zero(
     float* __restrict__ sc_stage,             // ABI compat; unused
     int T_src, int T_loc_max, int K, int cur,
     unsigned short* __restrict__ part,        // [T_loc_max, 7168] bf16 — zero rows < T_loc
-    // ---- optional arm-2 per-source readiness (pass quant_flags == nullptr for barrier arm) ----
+    // Optional per-source readiness; nullptr uses external synchronization.
     const unsigned int* __restrict__ quant_flags,   // SYMMETRIC [world]: quant_done per source
     const unsigned int* __restrict__ quant_count,   // LOCAL [1]: current quant epoch (stable)
     int* __restrict__ pperr2, long long spin_limit, int world) {
@@ -46,12 +31,11 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_gather_zero(
   const int lane = threadIdx.x & 63;
   const int gw = blockIdx.x * (blockDim.x >> 6) + (threadIdx.x >> 6);
   const int nw = gridDim.x * (blockDim.x >> 6);
-  // Arm 2 epoch: quant_count[0] is bumped by the quant tail before this kernel launches
-  // (stream order), so it stably reads the current replay's epoch N.
+  // Stream order makes quant_count stable for this epoch.
   const unsigned int epoch = (quant_flags != nullptr) ? quant_count[0] : 0u;
 
   for (int t = gw; t < T_loc; t += nw) {
-    // ---- the fold: zero this row's partial buffer (7168 bf16 = 14 warp chunks) ----
+    // Clear this live partial row.
     {
       unsigned char* prow = reinterpret_cast<unsigned char*>(part) + (size_t)t * 14336;
       const uint4 z = make_uint4(0u, 0u, 0u, 0u);
@@ -65,8 +49,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_gather_zero(
     const bool valid =
         (src_rank >= 0) && (src_rank < 8) && (src_tok >= 0) && (src_tok < T_src);
 
-    // Arm 2 per-source readiness: wait only for THIS row's source rank's quant to land.
-    // Rows whose source is already done proceed immediately (stragglers don't gate them).
+    // Wait only for this row's source rank.
     if (quant_flags != nullptr && valid) {
       if (lane == 0) {
         volatile const unsigned int* vf = quant_flags;
@@ -76,8 +59,8 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_gather_zero(
           __builtin_amdgcn_s_sleep(4);
         }
       }
-      __builtin_amdgcn_wave_barrier();                        // hold the warp until lane 0 confirms
-      __threadfence_system();                                // acquire
+      __builtin_amdgcn_wave_barrier();                        // Lane 0 releases the warp.
+      __threadfence_system();                                // Acquire source data.
     }
 
     unsigned char* __restrict__ drow = a_dst + (size_t)t * (size_t)K;

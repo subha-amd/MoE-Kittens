@@ -9,10 +9,10 @@ Five graph nodes, against production's eight:
 
 ```
 BF16 -> FP8 quantization
-  -> k0d_mega            (push dispatch + rendezvous + destination sort, fused)
+  -> k0d_mega            (push dispatch + barrier + destination sort, fused)
   -> n2_phase1           (W13)
   -> n2_phase2           (W2, write-once)
-  -> k0d_combine         (rendezvous + owner-pull reduction, fused)
+  -> k0d_combine         (barrier + owner-pull reduction, fused)
 ```
 
 Wired in [`harness/region_ab.py`](../harness/region_ab.py) as `k0d_mega_body`:
@@ -34,8 +34,8 @@ Converts the 64 local decode tokens from BF16 into the FP8 K128 representation a
 scales consumed by the dispatch and the GEMM, writing both directly into the symmetric
 staging buffers.
 
-This stays a separate graph node deliberately. Fusing decode quantization into a single
-CTA alongside the ingress was built and measured, and it was substantially slower.
+This remains a separate graph node because the measured single-CTA fusion with ingress was
+slower.
 
 ### 2. `k0d_mega` — fused ingress
 
@@ -47,10 +47,10 @@ persistent grid.
 load the eight expert ids and weights; deduplicate routes that share a destination GPU;
 atomically allocate one receive row on each distinct destination; push the token's FP8
 activation, scales, expert ids and route weights straight into that GPU's symmetric
-buffers; record the metadata the owner-pull combine will need. The important property is
-that one activation row is sent once per destination GPU, not once per expert slot.
+buffers; record the metadata the owner-pull combine will need. One activation row is sent
+once per destination GPU, not once per expert slot.
 
-**M2–M3, publish and rendezvous.** After all local CTAs have posted their remote writes,
+**M2–M3, publish and synchronize.** After all local CTAs have posted their remote writes,
 each CTA issues a system release fence, the final CTA publishes completion to every rank's
 doorbell, every CTA waits until all source ranks have completed the current epoch, and an
 acquire fence makes the payload visible. There is no standalone barrier kernel, but the
@@ -85,11 +85,11 @@ region's compute.
 [`kernels/decode/k0d_combine.hip`](../kernels/decode/k0d_combine.hip). Launch: 16 CTAs x
 256 threads.
 
-Its head contains an in-kernel all-rank rendezvous proving that every GPU's phase-2 GEMM
+Its head contains an in-kernel all-rank barrier proving that every GPU's phase-2 GEMM
 has completed. Each token owner then reads the list of ranks and rows that produced partial
 results, pulls those BF16 rows directly over P2P, accumulates them in FP32 in producer
 order, and writes the final BF16 token output. Direct peer reads, no staging copy. As with
-the ingress, there is no standalone post-GEMM barrier node: the rendezvous is folded into
+the ingress, there is no standalone post-GEMM barrier node: the barrier is folded into
 the combine head, which is also where MoRI puts its own.
 
 ## Results
@@ -114,28 +114,26 @@ In-graph device phase profile (`s_memrealtime` markers, marker overhead subtract
 | combine | 26.27 µs | 51.11 µs |
 | region total | 511.33 µs | 520.27 µs |
 
-## The honest verdict
+## Interpretation
 
-**`k0d_mega` is the best custom decode path here, and it is at parity with production, not
-a confirmed win.**
+`k0d_mega` is the fastest custom decode path measured here. Its results are at parity with
+production.
 
 - The warm median is nominally about 2.2% faster.
 - Cold performance is tied (1.0002x).
 - Four of the five paired processes straddle 1.0.
 - The p95 ratio is above 1.0.
 
-Where the remaining deficit sits, and what is worth attacking:
+Cost breakdown:
 
-- **The GEMM is the largest absolute cost** — 378 µs, 73.9% of the custom region — but it is
-  also where the custom path is *ahead* of production at the region level (377.88 vs 422.85).
+- The GEMM is the largest absolute cost: 378 µs, 73.9% of the custom region. The custom
+  region-level GEMM time is lower than production (377.88 vs 422.85).
   At the kernel level, measured in isolation, AITER's `fmoe` is still faster than our
   single-kernel GEMM.
-- **The ingress is 4.72 µs slower than production's, not faster.** (An earlier write-up
-  states this with the sign reversed in prose while its own table is correct; the table is
-  right and the custom ingress is the slower one.)
-- **The combine is the clearest win**: 26.27 µs against production's 51.11 µs for combine
+- The ingress is 4.72 µs slower than production's.
+- The combine is 26.27 µs against production's 51.11 µs for combine
   plus barrier.
-- **The ingress is also the variance source** — it correlates with the region's end-to-end
+- The ingress is also the variance source: it correlates with the region's end-to-end
   variance at r² ≈ 0.885.
 
 The dominant microarchitectural fact behind the ingress cost: on this stack a single
@@ -147,8 +145,8 @@ that ports to three protocol sites) and the M1 push sweep, where each token-warp
 roughly 34 sequential remote instructions and the fabric sits largely idle while warps
 serialize on delivery.
 
-## What is deliberately not here
+## Experimental successor
 
-An experimental successor, `k0d2_mega`, exists in the working tree it came from and is
-**not** carried into this repository. It bundles several changes at once and has neither a
-complete integration nor an A/B result. `k0d_mega` is the one that was measured.
+An experimental successor, `k0d2_mega`, is not included in this repository. It bundles
+several changes and lacks a complete integration and A/B result. The measurements above
+use `k0d_mega`.

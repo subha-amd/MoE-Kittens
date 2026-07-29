@@ -1,18 +1,7 @@
-// ================================================================================================
-// hkp_quant.hpp — bf16 -> FP8 e4m3 group quantization and the scale-layout utilities
-// (see ; quant math byte-identical to k0pf3_qpush.hip, which is
-// byte-identical to k0pf_quant and to n1g's A2 register quant at n2_phase1.cpp).
-//
-// Numerics that must NOT change:
-//   * groups are exactly 128 elements: in the warp tiling, chunk c covers elements
-//     [1024c, 1024c+1024) and lanes 8g..8g+7 cover group 8c+g — the amax reduction is an
-//     8-lane __shfl_xor tree over masks 1/2/4 and never leaves the segment.
-//   * scale = max(amax, 1e-6) / 448.  THE EPSILON IS NOT OPTIONAL: empty experts give
-//     amax = 0 and 448/0 = NaN (n2_phase1.cpp).
-//   * quantize: clamp x/scale to +-448, __HIP_SATFINITE, __HIP_E4M3.
-//   * combine-side bf16: unpack = top 16 bits of fp32 (exact); pack = RNE
-//     (u + 0x7FFF + lsb) >> 16, matching v_cvt_pk_bf16_f32.
-// ================================================================================================
+// BF16-to-FP8 E4M3 group quantization and scale-layout utilities.
+// Groups contain 128 elements and use an 8-lane amax reduction. Scale is
+// max(amax,1e-6)/448; the epsilon prevents NaN for empty experts. Conversion clamps to +/-448.
+// BF16 packing uses round-to-nearest-even.
 
 #ifndef HKP_QUANT_HPP
 #define HKP_QUANT_HPP
@@ -49,10 +38,7 @@ struct fp8_e4m3_group_quantizer {
     return __hip_cvt_float_to_fp8(q, __HIP_SATFINITE, __HIP_E4M3);
   }
 
-  // One 1024-element chunk: h16 points at THIS lane's 16 contiguous bf16 elements
-  // ([1024c + 16*lane, +16) of the row).  Returns the lane's 16 FP8 bytes; scale_out is
-  // the group scale, kept by the caller only on owner lanes (lane & 7) == 0 — the same
-  // distribution k0pf3_qpush.hip uses for sc_arr.
+  // Quantize this lane's 16 elements; lanes with lane%8==0 retain the group scale.
   static __device__ __forceinline__ uint4 quantize_chunk16(const unsigned short* h16,
                                                            int lane, float& scale_out) {
     float f[16];
@@ -76,10 +62,7 @@ struct fp8_e4m3_group_quantizer {
   }
 };
 
-// Prefill scale-store idiom (k0pf3_qpush.hip): owner lanes (lane & 7) == 0 write
-// the 56-group row directly as scalars, dst[c*8 + lane>>3] = sc_arr[c] — no cross-lane
-// redistribution.  The decode idiom (14 lanes x 16 B vectorized copy) is
-// post_peer_span<16>(..., 14) in hkp_store.hpp.
+// Scale-owner lanes write directly without cross-lane redistribution.
 template <int Chunks = 7>
 __device__ __forceinline__ void scatter_group_scales(float* dst, const float* sc_arr,
                                                      int lane) {
@@ -88,12 +71,7 @@ __device__ __forceinline__ void scatter_group_scales(float* dst, const float* sc
   for (int c = 0; c < Chunks; ++c) dst[c * 8 + (lane >> 3)] = sc_arr[c];
 }
 
-// ---------------------------------------------------------------------------
-// Scale layouts.  group_major is the production live-prefix layout
-// input_scale[k128 * T + token] — never the [capacity, 56] capacity stride
-// (n2_phase1.cpp).  row_major is the symmetric staging layout sc_stage[t * NG + g]
-// written by the push arms and transposed dest-side.
-// ---------------------------------------------------------------------------
+// group_major uses input_scale[k128*T+token]; row_major uses sc_stage[t*NG+g].
 enum class scale_layout { row_major, group_major, expert_nk };
 
 __device__ __forceinline__ std::size_t scale_index(scale_layout L, int g, int t, int NG,
@@ -111,21 +89,13 @@ __device__ __forceinline__ void transform_scale_element(const float* src, float*
   dst[scale_index(Dst, g, t, NG, T)] = src[scale_index(Src, g, t, NG, T)];
 }
 
-// [expert, n128, k128] weight-scale addressing: fc1_scale [32,32,56] and fc2_scale
-// [32,56,16] (n2_phase1.cpp, n2_phase2.cpp).
+// [expert, n128, k128] weight-scale addressing.
 __device__ __forceinline__ std::size_t expert_nk_offset(int e, int ng, int k, int n_groups,
                                                         int k_groups) {
   return ((std::size_t)e * n_groups + ng) * k_groups + k;
 }
 
-// ---------------------------------------------------------------------------
-// Fused zero-part + scale-transpose (3 sites: k0d_mega.hip, k0pf3_dsort.hip:
-// 189-203, k0d_dsort.hip): one warp zeros Chunks1K x 1 KiB bf16 chunks of part row t while
-// lanes < ng transpose that row's scales into group-major sc_dst.  The zero prefix is
-// EXACTLY [0, T_loc) — the phase-2 atomic epilogue requires it and the full-capacity host
-// memset is ~1.9x the store traffic (k0pf3_dsort.hip).  Per-row body; callers keep
-// their grid-stride row loop.
-// ---------------------------------------------------------------------------
+// Clear one live partial row while transposing its scales to group-major order.
 template <int Chunks1K = 14>
 __device__ __forceinline__ void zero_part_scale_transpose(unsigned short* part_row,
                                                           float* sc_dst,

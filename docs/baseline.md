@@ -27,7 +27,7 @@ The files worth reading:
 | runtime kernel selection and launch | [`src/ops/dispatch_combine/launch.cpp`](../baseline/mori/src/ops/dispatch_combine/launch.cpp) |
 | device peer addressing | [`include/mori/shmem/shmem_device_api.hpp`](../baseline/mori/include/mori/shmem/shmem_device_api.hpp) |
 
-Two MoRI details that the custom kernels deliberately mirror rather than reinvent:
+The custom kernels use two MoRI design details:
 
 - **The remote-atomic slot allocator.** A dispatch allocates a receive row on the
   destination with a remote atomic add; the returned value *is* the arrival row, and
@@ -37,13 +37,13 @@ Two MoRI details that the custom kernels deliberately mirror rather than reinven
   destination GPU is sent once, not once per expert slot. That is a structural fact, and it
   is why receive-buffer capacity is bounded by `world * T` rather than by `world * T * topk`.
 
-Two things the custom path does *not* copy:
+The custom path differs in two places:
 
 - MoRI's combine stages every received row into a local buffer before its barrier. Our
   combine reads the producer's published `part` row in place through a peer pointer, so that
-  copy does not exist on our side at all.
-- MoRI's on-stream barrier is a centralized two-phase coordinator rendezvous. Our
-  rendezvous is folded into the kernel that needs it, with one parallel release poke per
+  copy is absent from the custom path.
+- MoRI's on-stream barrier uses a centralized two-phase coordinator. The custom barrier is
+  folded into the kernel that needs it, with one parallel release poke per
   peer and a local flag spin.
 
 Disassembly of MoRI's two hot movement kernels, recovered for gfx950, is in
@@ -61,14 +61,13 @@ Disassembly of MoRI's two hot movement kernels, recovered for gfx950, is in
 | configuration table | [`asm_fmoe_configs.hpp`](../baseline/aiter/asm_fmoe_configs.hpp) |
 | recovered gfx950 disassembly | [`disassembly/aiter_fmoe.gfx950.s`](../baseline/aiter/disassembly/aiter_fmoe.gfx950.s) |
 
-**The critical caveat: AITER's production `fmoe_fp8_blockscale_g1u1` microkernel is a
-precompiled `.co` assembly blob.** The checkout contains the Python orchestration, the
+AITER's production `fmoe_fp8_blockscale_g1u1` microkernel is a precompiled `.co` assembly
+blob. The checkout contains the Python orchestration, the
 selector, the launch wrapper and the configuration tables — but no readable HIP source for
 the hot kernel. The disassembly above is what there is to read.
 
-This is the whole reason the project exists. You cannot fuse anything into a fixed `.co`
-blob. Owning the kernel is what makes it possible to pull the movement into the same kernel
-as the compute and reschedule the two together.
+A fixed `.co` blob cannot be modified to fuse movement with compute. An editable kernel
+allows the two to be combined and rescheduled.
 
 On a live node, an editable AITER checkout typically sits at `~/aiter-src` inside the
 container, installed editable, with the relevant paths being `aiter/fused_moe.py`,

@@ -1,30 +1,9 @@
-// ===========================================================================
-// n2_phase1.cpp — expert GEMM, phase 1 of 2: the W13 projection, with the
-// intermediate activation handed to phase 2 through a small global buffer.
-//
-// The pair (n2_phase1, n2_phase2) exists to change one thing about the W2
-// reduction: a split-K W2 writes each output element eight times through BF16
-// atomic partials, an 8x write amplification.  Phase 2 instead does split-N
-// full-K, so every output element is written exactly once.  Phase 1 is what
-// makes that possible: it materializes the quantized intermediate activation
-// rather than passing it through LDS.
-//
-// The GEMM itself is unchanged from the single-kernel version: task = (sorted
-// block b, intermediate chunk g), a CTA-shared A tile, the 56-step paired
-// gate/up K-loop with 17 loads in flight, register SiLU, a dynamic
-// per-(row, K128) amax, and FP8 E4M3 quantization.  The math, the schedule and
-// every scale are identical.  Only the destination changes:
-//
+// Phase 1 of the two-phase expert GEMM: W13 projection and quantized intermediate handoff.
+// A CTA-shared activation tile feeds the paired gate/up K loop. SiLU output is quantized to:
 //   A2q[row_global, 256g : +256]  FP8 E4M3, row-major, 2048 B rows
 //   DQ2[row_global, 2g + kb]      FP32 dequant scale = max(amax, 1e-6) / 448
 //
-// Both are fully written for every row < nvi[0] on every call — padding rows
-// carry exact zeros from the live-select — so phase 2 never reads a stale byte.
-// No zeroing, no epoch state, and safe under a route swap by construction.
-//
-// This kernel writes no output rows: the entire split-K GEMM-2, its LDS staging
-// and every output atomic are gone from phase 1.
-// ===========================================================================
+// Every row below nvi[0] is overwritten; padding rows contain zero.
 
 #include "kittens.cuh"
 #include "n2_fused_moe.hpp"
@@ -45,14 +24,14 @@ namespace production_fused_moe::n2 {
 
 namespace aiter = production_fused_moe::aiter_gfx950;
 
-// ---- production geometry (CLAUDE.md I/O contract) --------------------------
+// ---- geometry --------------------------------------------------------------
 constexpr int kExperts = 32;
 constexpr int kHidden = 7168;    // K of W13, N of W2
 constexpr int kW13N = 4096;      // rows [0,2048) gate, [2048,4096) up
 constexpr int kInter = 2048;     // intermediate dim
 constexpr int kBlockM = 32;      // Opus sorted block
 
-// ---- the decomposition (stock's) ------------------------------------------
+// ---- decomposition ---------------------------------------------------------
 constexpr int kChunks = 8;                        // intermediate chunks
 constexpr int kChunkCols = kInter / kChunks;      // 256
 constexpr int kWaves = 4;
@@ -93,9 +72,7 @@ static_assert(rfp8::base_tile_elements_per_stride_group == 64);
 static_assert(racc::height == 1 && racc::width == 1);
 static_assert(racc::packed_per_thread == 2);              // 4 floats / lane
 
-// ---------------------------------------------------------------------------
-// The WEIGHT loader.
-// ---------------------------------------------------------------------------
+// Weight-fragment loader.
 __device__ __forceinline__ void load_bfrag(rfp8& dst, const std::uint8_t* p) {
   float4* d = reinterpret_cast<float4*>(&dst.tiles[0][0].data[0]);
   d[0] = *reinterpret_cast<const float4*>(p);
@@ -125,17 +102,14 @@ __device__ __forceinline__ f32x2* accv(racc& a) {
   return reinterpret_cast<f32x2*>(&a.tiles[0][0].data[0]);
 }
 
-// The CTA barrier for the LDS A tile.  LOCAL ADDRESS SPACE ONLY — no vmcnt(0)
-// may reach the K-loop.
+// Local-memory-only CTA barrier; it must not drain VMEM in the K loop.
 __device__ __forceinline__ void lds_cta_barrier() {
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
   __builtin_amdgcn_s_barrier();
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 
-// ===========================================================================
-// PHASE 1: W13 -> register SiLU -> dynamic amax -> FP8 quant -> GLOBAL A2 handoff
-// ===========================================================================
+// W13, SiLU, FP8 quantization, and A2 handoff.
 __global__ __launch_bounds__(kThreads, 1) void n2_phase1_kernel(
     const std::uint8_t* __restrict__ A_bytes,   // input  [R, 7168] FP8
     const float* __restrict__ A_scale,          // input_scale, group-major live
@@ -161,12 +135,12 @@ __global__ __launch_bounds__(kThreads, 1) void n2_phase1_kernel(
   const int wv = tid >> 6;   // wave 0..3
   const int q = lane >> 4;   // 0..3
   const int r = lane & 15;   // 0..15
-  const int T = nvi[1];      // live token count -- read ON DEVICE
+  const int T = nvi[1];
 
-  // The work count, read ON DEVICE.
+  // Work count is device-derived.
   const int num_tasks = (((nvi[0] + (kBlockM - 1)) >> 5) << 3);
 
-  // THE BOUNDED INPUT DESCRIPTOR.
+  // Padding-row loads return zero through the bounded descriptor.
   const std::uint32_t a_num_records =
       static_cast<std::uint32_t>(T) * static_cast<std::uint32_t>(kHidden);
   const i32x4 a_rsrc = make_srsrc(A_bytes, a_num_records, 0);
@@ -214,9 +188,7 @@ __global__ __launch_bounds__(kThreads, 1) void n2_phase1_kernel(
             static_cast<std::uint32_t>(kHidden) +
         static_cast<std::uint32_t>(a_chunk * kAChunkBytes);
 
-    // =======================================================================
-    // GEMM-1 : PAIRED gate/up.
-    // =======================================================================
+    // Paired gate/up GEMM.
     racc acc[2][2][kColTiles];
 #pragma unroll
     for (int gu = 0; gu < 2; ++gu) {
@@ -391,7 +363,7 @@ __global__ __launch_bounds__(kThreads, 1) void n2_phase1_kernel(
     }
     __syncthreads();
 
-    // THE EPSILON IS NOT OPTIONAL (rank 2 has empty experts; 448/0 = NaN).
+    // The epsilon prevents NaN for empty experts.
 #pragma unroll
     for (int m = 0; m < 2; ++m) {
       float dq[4];
@@ -412,11 +384,7 @@ __global__ __launch_bounds__(kThreads, 1) void n2_phase1_kernel(
     }
     __syncthreads();
 
-    // =======================================================================
-    // THE ONE VARIABLE (phase-1 half): A2 -> GLOBAL, coalesced, in place of the
-    // split-K GEMM-2.  a2_lds[row][col] -> A2q[(b*32+row)*2048 + 256g + col].
-    // 256 threads x 32 B = the 8 KiB tile; 16 B vectors, fully coalesced.
-    // =======================================================================
+    // Store the 8 KiB A2 tile to its row-major handoff buffer.
     {
       const int cr = tid >> 3;   // row 0..31
       const int cc = tid & 7;    // 32-B chunk 0..7
@@ -448,9 +416,8 @@ __global__ __launch_bounds__(kThreads, 1) void n2_phase1_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Host side.  Production tensors + the two scratch handoff buffers (allocated
-// once at setup by the caller; no host work inside the measured region).
-// input capacity is a RUNTIME property (device-driven walk) — only column
+// Host state includes production tensors and two setup-time handoff buffers.
+// Input capacity is device-derived; only column
 // counts are contract-checked, so the same module serves decode and prefill.
 // ---------------------------------------------------------------------------
 struct n2_phase1_globals {

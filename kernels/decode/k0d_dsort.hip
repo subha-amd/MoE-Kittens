@@ -1,11 +1,5 @@
-// ================================================================================================
-// k0d_dsort.hip — destination-side sort and plan construction for the push-dispatched decode path.
-//
-// After k0d_push the receive rows have arrived in nondeterministic atomic order, and the only
-// routing knowledge on this rank is the pushed recv_eid / recv_wgt arrays.  This kernel is the
-// local sorter for that state, shaped for decode (T_loc <= 512 rows, pairs = T_loc * 8 <= 4096,
-// E <= 64 local experts).  It produces exactly the tensors the GEMM and the combine already
-// consume, so neither needs modification:
+// Destination sort and plan construction for push-dispatched decode. Received rows arrive in
+// nondeterministic atomic order. Output layouts:
 //   sti[row]  = (arrival_row & 0x00FFFFFF) | (slot << 24)   arrival_row indexes a_dst; the GEMM's
 //               A-descriptor bounds token >= nvi[1] to zero, so the padding sentinel is load-safe
 //   swt[row]  = route weight (0.0f on padding rows)
@@ -15,33 +9,11 @@
 //   sc_dst[g * T_loc + t]      group-major scales, transposed locally from row-major sc_stage
 //   part[0, T_loc)             zeroed, as the GEMM's phase-2 atomic epilogue requires
 //
-// SORT ORDER: within an expert's segment, rows are placed by atomic cursor rather than in a
-// deterministic route order.  This is safe because the GEMM's rows are independent (phase 1
-// computes each row's tile alone, and phase 2's per-row epilogue atomics already race in the
-// production kernel), and acceptance is tolerance-based rather than bitwise.  Atomic cursors
-// remove the per-chunk count/base and ordered-compaction machinery a global plan needs.
-//
-// THE DOORBELL IS ALSO THE CROSS-EPOCH GUARD for part:
-//   recv_doorbell[src] >= epoch N+1 proves src's push(N+1) completed, hence src's combine(N)
-//   returned in stream order on src.  Once all doorbells are up, every rank's combine(N) is done,
-//   so no remote combine can still be pulling this rank's part when it is zeroed below.
-//
-// PHASES (grid (16, 256); two internal monotonic grid barriers via a cumulative counter):
-//   P0  every CTA: threads tid < world spin on recv_doorbell[tid] >= epoch (bounded,
-//       fail-closed); acquire fence; T_loc = dest_counter[0].
-//   P2  task split, no barrier.  CTA0 counts local-expert pairs with LDS atomics and runs the
-//       serial padded scan into erb/cnt/cursor scratch, nvi and sei.  CTA1 builds the combine CSR
-//       (one 64-wide wave scan over pull_cnt, then per-token slot compaction).  CTAs 2..15 zero
-//       part[0, T_loc) in 14 x 1 KB warp chunks per row and transpose sc_stage into sc_dst.
-//   P3  grid barrier, publishing CTA0's scratch and nvi.
-//   P4  all CTAs: write the padding sentinel rows over the disjoint ranges [erb+cnt, erb_next),
-//       which cannot race the scatter, then scatter live pairs through per-expert atomic cursors.
-//   P5  CTA0 thread 0 resets dest_counter and advances sort_count to this epoch.
-//
+// Expert-local order is nondeterministic because scatter uses atomic cursors. The doorbell wait
+// also proves all previous-epoch combines stopped reading part before it is cleared.
 // pperr bits: 1024 doorbell spin timeout, 2048 T_loc out of range, 4096 scatter row overflow,
 // 8192 internal grid-barrier spin timeout, 256 shape guard, 2 PADMAX overflow.
 // Scratch layout (LOCAL int scratch[256]): erb[0..64] at 0, cnt at 80, cursors at 160.
-// ================================================================================================
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -88,7 +60,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
 
   const unsigned int epoch = sort_count[0] + 1u;
 
-  // ================= P0: doorbell wait (also the cross-epoch part guard) ==================
+  // Wait for payloads and previous-epoch readers.
   if (tid < world) {
     volatile const unsigned int* vf = recv_doorbell;
     long long spins = 0;
@@ -98,7 +70,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
     }
   }
   __syncthreads();
-  __threadfence_system();   // acquire: recv payloads, dest_counter, and the part-reuse proof
+  __threadfence_system();   // Acquire payloads, counter, and the part-reuse guard.
 
   const int T_loc = (int)dest_counter[0];
   if (T_loc < 0 || T_loc > T_loc_max) {
@@ -106,20 +78,20 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
     return;
   }
 
-  // ================= P2: task-split plan work (no barrier) ================================
+  // Build plan metadata and prepare live rows.
   if (bid == 0) {
-    // ---- per-expert counts over the received pairs (LDS atomics) ----
+    // Count received pairs per expert.
     __shared__ int s_cnt[K0DS_MAXE];
     for (int i = tid; i < E; i += 256) s_cnt[i] = 0;
     __syncthreads();
     const int lo = cur * E, hi = lo + E;
     const int pairs = T_loc * TOPK;
     for (int j = tid; j < pairs; j += 256) {
-      const int e = recv_eid[j];   // flat [row][slot] == j
+      const int e = recv_eid[j];
       if (e >= lo && e < hi) atomicAdd(&s_cnt[e - lo], 1);
     }
     __syncthreads();
-    // ---- padded BM32 scan (serial, E <= 64) ----
+    // Build padded BM32 expert segments.
     if (tid == 0) {
       int acc = 0;
       for (int e = 0; e < E; ++e) {
@@ -132,7 +104,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
       nvi[1] = T_loc;
     }
     __syncthreads();
-    // ---- scatter cursors + sorted-expert-ids (needs the scan) ----
+    // Initialize scatter cursors and expert IDs.
     {
       const int bcap = PADMAX / 32;
       for (int e = tid; e < E; e += 256) {
@@ -146,7 +118,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
       }
     }
   } else if (bid == 1) {
-    // ---- owner combine CSR: 64-wide wave prefix over pull_cnt, then slot compaction ----
+    // Build the owner-combine CSR.
     if (tid < 64) {
       const int tau = tid;
       const int f = (tau < T) ? pull_cnt[tau] : 0;
@@ -172,7 +144,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
       }
     }
   } else {
-    // ---- zero part[0, T_loc) + transpose scales (needs T_loc only) ----
+    // Clear live partial rows and transpose scales.
     const int lane = tid & 63;
     const int w = (bid - 2) * (blockDim.x >> 6) + (tid >> 6);
     const int nw = (gridDim.x - 2) * (blockDim.x >> 6);
@@ -187,10 +159,10 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
     }
   }
 
-  // ================= P3: grid barrier (publishes scratch + nvi) ===========================
+  // Publish local plan outputs.
   __syncthreads();
   if (tid == 0) {
-    __threadfence();   // device release (scratch/nvi/sei/part/sc_dst writes are this GPU's)
+    __threadfence();   // Device release.
     const unsigned int old =
         __hip_atomic_fetch_add(gbar, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT);
     const unsigned int target = (old / gridDim.x + 1u) * gridDim.x;
@@ -202,12 +174,12 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
     }
   }
   __syncthreads();
-  __threadfence();   // device acquire
+  __threadfence();   // Device acquire.
 
-  // ================= P4: pad sentinel + atomic-cursor scatter =============================
+  // Pad expert segments and scatter live pairs.
   {
     const int lo = cur * E, hi = lo + E;
-    // pad rows live in [erb[e] + cnt[e], erb[e+1]) — disjoint from every scatter position.
+    // Padding ranges are disjoint from scatter positions.
     for (int idx = bid * 256 + tid; idx < E * 32; idx += gridDim.x * 256) {
       const int e = idx >> 5, k = idx & 31;
       const int row = scratch[K0DS_SC_ERB + e] + scratch[K0DS_SC_CNT + e] + k;
@@ -230,10 +202,10 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_dsort(
     }
   }
 
-  // ================= P5: tail — reset allocator, advance epoch ============================
+  // Reset the allocator and advance the epoch.
   __syncthreads();
   if (bid == 0 && tid == 0) {
-    dest_counter[0] = 0u;     // next epoch's allocations restart at row 0
-    sort_count[0] = epoch;    // plain store; next kernel on this stream reads it
+    dest_counter[0] = 0u;
+    sort_count[0] = epoch;
   }
 }

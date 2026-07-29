@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Per-rank in-graph phase attribution for the pf4h destination-sort arm.
 
-The region headline (aligned-MAX p50/p95 and the arm-versus-production ratios) comes from
-the campaign summary. This adds the part that summary cannot show: the per-rank boundary
-phases recorded when K0_DECODE_PHASE_PROFILE=1, which is where the destination sort's
-count-phase change is actually visible.
+The campaign summary provides aligned-MAX p50/p95 and arm-versus-production ratios. This
+script reports per-rank boundary phases recorded when K0_DECODE_PHASE_PROFILE=1, including
+the destination sort's count phase.
 
 Usage:
     summarize_pf4h.py <run-directory-glob> [...]

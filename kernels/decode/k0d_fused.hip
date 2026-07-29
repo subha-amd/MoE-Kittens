@@ -1,34 +1,7 @@
-// ================================================================================================
-// k0d_fused.hip — decode ingress collapse: route all-gather, plan build and origin quantization
-// in ONE kernel, ONE block of 1024 threads.
-//
-// At decode scale (N = world * T <= 512 global tokens, NCHUNK <= 16, T <= 512) the multi-kernel
-// plan pays full launch and tail latency for a few microseconds of work per launch, so a single
-// block does the entire ingress faster.  Launch count is the decode bottleneck; parallelism is
-// what prefill needs, which is why the multi-kernel plan is kept for that regime and the harness
-// falls back to it outside this kernel's guards.
-//
-// The algorithm is equivalent to the multi-kernel plan for every output:
-//   own / tof / tloc / gath / nvi   same predicate plus integer prefix scans
-//   cnt / ccnt                      order-independent atomics, in LDS
-//   erb / sei / nvi[0]              same serial recurrences
-//   sti / swt                       ordered compaction: a pair's rank is the number of earlier
-//                                   same-expert pairs in the 256-pair chunk, computed as a
-//                                   wave-local __match_any_sync plus preceding-wave counts
-//                                   (-DK0D_SORT_SERIAL restores the serial loop)
-//   pull_ptr / pull_src             per-token fanout prefix plus a rank-ordered producer list
-//   padding sentinel                rows [0, nvi[0]) only
-//   quant                           128-element groups, dynamic amax scale, SATFINITE E4M3,
-//                                   sc_src row-major
-//
-// WIRING: replaces the route all-gather, the plan build and the origin quant in the custom decode
-// path.  Launch (1, 1024) on the capture stream.  Guards (error bit 64, harness falls back):
-// N <= 512, NCHUNK <= 16, TOPK == 8, world <= 8, E <= 64, T <= 512.
-//
-// GRAPH SAFETY: one kernel, no host reads, all counts device-side, ShmemGetMemBlock for the route
-// pull.  The plan is rebuilt in full on every replay, so a poison test that clears nvi and
-// pull_ptr between replays still passes.
-// ================================================================================================
+// Decode route all-gather, plan construction, and origin quantization in one 1024-thread block.
+// Ordered compaction ranks each pair by earlier same-expert pairs in its 256-pair chunk.
+// Quantization uses 128-element groups and row-major scales.
+// Limits: N<=512, NCHUNK<=16, TOPK=8, world<=8, E<=64, and T<=512.
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -39,8 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-// The wave-parallel compaction below is the production path.  Define K0D_SORT_SERIAL explicitly
-// at compile time only when bisecting compaction correctness.
+// K0D_SORT_SERIAL enables the reference serial compaction.
 
 #define K0D_MAXN 512         // world*T guard (decode B64 at EP8 is exactly 512)
 #define K0D_MAXCHUNK 16      // (world*T*TOPK)/256 guard (B64 at EP8 is exactly 16)
@@ -94,15 +66,13 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
   __shared__ int s_cur[4][K0D_MAXE];
   __shared__ int s_erb[K0D_MAXE + 1];
 
-  // ================= phase 0: reset =================
-  // NOTE: s_ccnt's flat row stride is K0D_MAXE (64), NOT E — the zero extent must cover the used
-  // rows (c < NCHUNK) at that stride.  (NCHUNK * E zeroed only chunks 0-7; 8-15 held LDS garbage.)
+  // s_ccnt has a fixed K0D_MAXE row stride; clear all used rows at that stride.
   for (int i = tid; i < E; i += 1024) s_cnt[i] = 0;
   for (int i = tid; i < NCHUNK * K0D_MAXE; i += 1024) (&s_ccnt[0][0])[i] = 0;
   if (tid == 0) *perr = 0;
   __syncthreads();
 
-  // ================= phase 1: route all-gather =================
+  // Route all-gather.
   {
     const int cnt = T * TOPK;
     for (int r = 0; r < world; ++r) {
@@ -121,7 +91,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
     }
   }
 
-  // ================= phase 2: own =================
+  // Build per-rank ownership.
   for (int gtok = tid; gtok < N; gtok += 1024) {
     const int* ids = all_ids + (size_t)gtok * TOPK;
     const uint4 i01 = *reinterpret_cast<const uint4*>(ids);
@@ -139,7 +109,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
   }
   __syncthreads();
 
-  // ================= phase 3: tof =================
+  // Prefix ownership into local token offsets.
   for (int p = 0; p < world; ++p) {
     const int i = tid;
     const int v = (i < N) ? s_own[p][i] : 0;
@@ -161,7 +131,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
     __syncthreads();
   }
 
-  // ================= phase 4: gath =================
+  // Build the gather map.
   if (tid == 0) nvi[1] = tloc[cur];
   for (int gtok = tid; gtok < N; gtok += 1024) {
     if (!s_own[cur][gtok]) continue;
@@ -172,7 +142,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
   }
   __syncthreads();
 
-  // ================= phase 5: count =================
+  // Count local-expert pairs.
   {
     const int lo = cur * E, hi = lo + E;
     for (int j = tid; j < n; j += 1024) {
@@ -185,7 +155,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
   }
   __syncthreads();
 
-  // ================= phase 6: scan =================
+  // Build padded expert segments.
   if (tid == 0) {
     int acc = 0;
     for (int e = 0; e < E; ++e) {
@@ -219,7 +189,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
   }
   __syncthreads();
 
-  // ================= phase 7: pad =================
+  // Initialize padding rows.
   {
     const int padded = nvi[0];
     const int T_loc = nvi[1];
@@ -230,12 +200,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
   }
   __syncthreads();
 
-  // ================= phase 8: sorted =================
-  // rank = #earlier same-expert pairs in the 256-thread group.  __match_any_sync is WAVE-LOCAL on
-  // AMD, so: EVERY thread joins the match (inactive pairs participate with le == -1 — the match
-  // call must NOT sit inside a divergent guard), the lowest lane of each (wave, expert) publishes
-  // the wave count, an unconditional CTA barrier, then rank = lane-local rank + preceding-wave
-  // counts, generalized to 4 independent groups.
+  // __match_any_sync is wave-local and must be called by every thread before wave counts merge.
   {
     const int grp = tid >> 8;          // 0..3
     const int gtid = tid & 255;        // pair index within the chunk
@@ -305,7 +270,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
     }
   }
 
-  // ================= phase 9: pull =================
+  // Build the owner pull plan.
   {
     int carry = 0;
     for (int base = 0; base < T; base += 64) {
@@ -342,14 +307,10 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
     }
   }
 
-  // ================= arm-2 head-wait (before any a_src/sc_src/part-clobbering write) =============
-  // Edge A (quant-N+1 must not clobber a_src that gather-N still reads) and edge D (n2-N+1 must
-  // not clobber part that combine-N still reads) are BOTH covered by ONE wait: combine_done >=
-  // quant_count[0] (== replay N-1), because combine-N done implies gather-N done.  Placed right
-  // before the quant phase so the route+plan above overlaps the previous combine's drain.
+  // Wait before quantization reuses a_src or part; combine completion implies gather completion.
   if (do_quant && comb_flags != nullptr) {
     if (tid < world) {
-      const unsigned int target = quant_count[0];        // replay N-1 (count not yet bumped)
+      const unsigned int target = quant_count[0];        // Previous epoch.
       volatile const unsigned int* vf = comb_flags;
       long long spins = 0;
       while (vf[tid] < target) {
@@ -358,17 +319,17 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
       }
     }
     __syncthreads();
-    __threadfence_system();                                // acquire
+    __threadfence_system();                                // Acquire completion.
   }
 
-  // ================= phase 10: quant =================
+  // Quantize activations.
   if (do_quant) {
     const int groups = T * NG;
     for (int gidx = tid; gidx < groups; gidx += 1024) {
       const int t = gidx / NG;
       const int g = gidx % NG;
       const unsigned short* hrow = hidden + (size_t)t * 7168 + (size_t)g * 128;
-      // pass 1: amax over exactly the same 128-element group
+      // Compute amax over one 128-element group.
       float amax = 0.0f;
 #pragma unroll
       for (int v = 0; v < 16; ++v) {
@@ -380,7 +341,7 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
       }
       const float scale = fmaxf(amax, 1.0e-6f) / 448.0f;
       sc_src[(size_t)t * NG + g] = scale;
-      // pass 2: convert + store (uint2 = 8 fp8 per store)
+      // Convert and store eight FP8 values per write.
 #pragma unroll
       for (int v = 0; v < 16; ++v) {
         const uint4 raw = *reinterpret_cast<const uint4*>(hrow + v * 8);
@@ -398,11 +359,11 @@ extern "C" __global__ void __launch_bounds__(1024, 1) k0d_fused(
     }
   }
 
-  // ================= arm-2 tail-signal: publish quant_done (edge B for the gather) ===============
+  // Publish quantization completion for gather.
   if (do_quant && comb_flags != nullptr) {
-    __syncthreads();                                       // all quant writes precede tid0's fence
+    __syncthreads();                                       // Quant writes precede the release.
     if (tid == 0) {
-      __threadfence_system();                              // release
+      __threadfence_system();                              // Release quantized data.
       const unsigned int epoch = quant_count[0] + 1;
       quant_count[0] = epoch;
       for (int pe = 0; pe < world; ++pe) {

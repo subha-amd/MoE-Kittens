@@ -6,7 +6,7 @@ A rank receives 12k–21k rows depending on how the routes land.
 ## Composition
 
 ```
-k0pf3_qpush     origin quantization fused into a source push, plus the folded rendezvous
+k0pf3_qpush     origin quantization fused into a source push, plus the folded barrier
 k0pf4_dsort     destination-side sort with a hierarchical multi-CTA expert histogram
 n2_phase1       W13
 n2_phase2       W2, write-once
@@ -25,10 +25,9 @@ distinct destination with a remote atomic, quantizes its BF16 row to FP8 **in re
 and posts the payload fire-and-forget through peer pointers. Because the quantization is
 local and register-resident, no rank ever waits on a remote quantization.
 
-What this deletes, relative to a pull-based prefill dispatch: the route all-gather, the
-whole plan build, a standalone quantization kernel, the pre-dispatch barrier, the pull
-itself, and a scale transpose. The sorted GEMM metadata the plan used to build is rebuilt
-destination-side instead.
+Relative to pull-based prefill dispatch, this removes the route all-gather, plan build,
+standalone quantization kernel, pre-dispatch barrier, pull, and scale transpose. The
+destination rebuilds the sorted GEMM metadata.
 
 ### `k0pf4_dsort` — the change this arm isolates
 
@@ -42,7 +41,7 @@ region's pace, the serial count *was* region time.
 Here every CTA histograms a disjoint grid-stride slice into LDS, publishes its own `[E]`
 counts to local scratch, and after one extra grid barrier CTA 0 reduces the `[E][gridDim]`
 table into exactly the counts the padded scan already consumed. Integer addition is
-associative, so the counts are bit-identical to the serial version, not merely equivalent.
+associative, so the counts are bit-identical to the serial version.
 Everything downstream is untouched.
 
 ## Results
@@ -61,7 +60,7 @@ Five independent processes, arms `production`, `pf3_pd`, `pf4h`, graph mode, ali
 | `pf4h / production` | 0.96865 | 0.98573 | 0.97472 | 0.99069 |
 | `pf4h / pf3_pd` | 0.98291 | 0.99588 | 0.98234 | 0.99677 |
 
-The ranges separate, not just the medians: the worst `pf4h` warm p50 across the five
+The ranges also separate: the worst `pf4h` warm p50 across the five
 processes (8161.39 µs) is below the best production (8408.05 µs) and the best `pf3_pd`
 (8272.49 µs). Every `pf4h` p95 ratio is below 1.0 against both comparators in both cache
 conditions.
@@ -84,10 +83,9 @@ Device-marker phase attribution of the destination sort, per rank:
 Rank 3 is the critical rank. Its 146 µs reduction is what shows up as the ~140–146 µs
 region delta against `pf3_pd` — roughly 1.7–1.8% of the complete region.
 
-## What `pf4h` did not attack
+## Remaining costs
 
-PF4H did **not** address the largest prefill problem. It addressed the cleanest isolated
-one.
+PF4H changes destination sorting; it does not address cross-rank expert-load imbalance.
 
 | problem | evidence | approximate headroom | addressed? |
 |---|---|---:|---|
@@ -112,27 +110,15 @@ balance model — fitted at 0.136507 µs per entry from rank 3's measured 5,712 
 the recoverable amount at about **1.24 ms, or 15.7% of the region**, from moving the hottest
 rank toward the mean.
 
-The load-balancing evidence is promising but it is **not yet a kernel result**: a B=4 slot
+The load-balancing estimate is not a kernel result: a B=4 slot
 budget proved insufficient (remote expert-segment counts by destination are
 `[4, 0, 2, 1, 2, 5, 1, 1]`, so rank 5 needs a fifth), placement adds ~13% dispatch fan-out,
 and remote-weight movement may be expensive. It is a route-derived upper-bound model that
 needs same-run graph A/B confirmation once an implementation exists.
 
-### Why `pf4h` was still worth doing
+### Destination-sort scope
 
-The destination sort was a particularly clean target: it ran on the critical rank, one CTA
-did the expensive expert histogram while most other CTAs went idle, and the change could be
-isolated without touching the push, the GEMM, the synchronization, or the combine. The
-expected improvement was measurable and low-risk, and it landed.
-
-So the honest characterization is: **PF4H solved the largest obvious inefficiency inside
-destination sorting, but destination sorting was only the third-largest prefill problem.
-Cross-rank GEMM load imbalance remains the dominant unsolved one.**
-
-## Caveat that travels with every prefill number here
-
-All prefill measurements in this repository are **diagnostic, not promotion-valid**. The
-corpus they replay is data-complete but was never formally accepted, and no accepted prefill
-corpus exists. Only one complete prefill route is available, so the campaign carries no
-non-vacuous route-swap proof. The right disposition is to treat `pf4h` as the best
-diagnostic prefill baseline and re-run it against an accepted route suite.
+The destination sort runs on the critical rank. One CTA previously handled the expert
+histogram while the others became idle. `pf4h` parallelizes that work without changing the
+push, GEMM, synchronization, or combine. Cross-rank GEMM load imbalance remains the largest
+measured prefill cost.

@@ -1,39 +1,7 @@
-// ================================================================================================
-// k0pf_plan.cpp — prefill-scale rebuild of the multi-stage plan in tile_plan.cpp.  The plan math
-// is unchanged: the same own / tof / gath / count / scan / pad / sorted / pull pipeline, and the
-// same outputs.  Integer prefix sums are associative, so the values do not depend on how they are
-// computed; only the decomposition changes.
-//
-// THREE THINGS THAT DECODE HID AND PREFILL DOES NOT (at T = 4096, N = 32768, n = 262144):
-//
-//   1. The pull-plan build was QUADRATIC.  Thread tau recomputed its prefix by re-reading
-//      own[p][*] for all u < tau across 8 ranks, which is about T^2 * W / 2 = 67M L2 sector reads
-//      spread over 16 blocks.  It is now a scan (per-token fanout is 8 reads, Hillis-Steele plus a
-//      carry over 16 tiles, writing pull_ptr) followed by a fill (one thread per token walks its 8
-//      own[] entries once and writes pull_src) — roughly 100K reads instead of 67M.
-//
-//   2. The token-offset scan ran on 8 BLOCKS TOTAL, each a serial 128-tile scan of N = 32768 with
-//      thousands of __syncthreads, leaving 8 of 256 CUs busy.  It is now a two-level scan: L1
-//      (world x 16 blocks over 2048-entry chunks, writing chunk partials), L2 (8 blocks,
-//      exclusive-scan the 16 partials per rank), L3 (world x 16 blocks, add the chunk base).
-//      Deterministic, and the values are identical.
-//
-//   3. Padding initialized the full PADMAX row capacity — a 2 MB sentinel sweep, many times the
-//      live padded rows.  It now reads nvi[0] ON DEVICE (written by the scan on the same stream)
-//      and returns early past it.  Rows >= nvi[0] are never read: nvi[0] is a multiple of 32 by
-//      construction, so the GEMM's block walk names only rows below it, and every other consumer
-//      is bounded by nvi[0] or nvi[1] as well.
-//
-//   4. The scan writer bounds-checks sorted_expert_ids itself (b >= PADMAX/32 sets error bit 2)
-//      rather than relying only on the host capacity guard.  An unguarded scan write past capacity
-//      corrupts num_valid_ids, which is not a failure you want to debug from a wrong result.
-//
-// Unchanged and already parallel: reset, own, gath, count, sorted.  zero_partial is verbatim and
-// already bounded by T_loc on device.
-//
-// ABI: same exported names build_plan_prod / zero_partial, same argument order plus one new
-// scratch tensor tof_part [world * 16] int32 inserted after tloc.
-// ================================================================================================
+// Prefill-scale deterministic plan construction.
+// Token offsets use a three-level scan over 2048-entry chunks. The pull plan uses a fanout scan
+// followed by a fill. Padding is bounded by device-computed nvi[0]. tof_part stores per-rank chunk
+// partials and supports at most 16 chunks per rank.
 #include "kittens.cuh"
 #include "pyutils/pyutils.cuh"
 #include <hip/hip_fp8.h>
@@ -61,16 +29,16 @@ struct plan_globals_k0pf {
     gl<int,   -1, -1, -1, -1> cnt;        // [E, 1]
     gl<int,   -1, -1, -1, -1> erb;        // [E+1, 1]
     gl<int,   -1, -1, -1, -1> ccnt;       // [NCHUNK, E]
-    // --- out: the PRODUCTION CONTRACT ---
+    // --- output ---
     gl<int,   -1, -1, -1, -1> gath;
     gl<int,   -1, -1, -1, -1> sorted_token_ids;
     gl<float, -1, -1, -1, -1> sorted_weights;
     gl<int,   -1, -1, -1, -1> sorted_expert_ids;
     gl<int,   -1, -1, -1, -1> num_valid_ids;
-    // --- out: the COMBINE's pull plan ---
+    // --- combine pull plan ---
     gl<int,   -1, -1, -1, -1> pull_ptr;
     gl<int,   -1, -1, -1, -1> pull_src;
-    // --- out: THE OVERFLOW FLAG (fail loud, never silent-drop) ---
+    // --- capacity errors ---
     gl<int,   -1, -1, -1, -1> err;
     int world, T, TOPK, E, cur_rank, T_loc_max, PADMAX;
     uint64_t stream_handle;  // explicit capture stream for build_plan_prod_stream
@@ -125,15 +93,13 @@ __device__ __forceinline__ int e26_block_incl_scan(int v, int* tmp) {
     return r;
 }
 
-// L1: one block per (rank, 2048-entry chunk).  Exclusive prefix WITHIN the chunk; chunk total ->
-// tof_part[p*ntc + c].  8 tiles of 256 with a running carry (same construction as the scan, so the
-// per-tile arithmetic is bit-identical; only the chunk boundary is new).
+// L1: exclusive prefix within each 2048-entry rank chunk.
 __global__ void k0pf_tof_l1_kernel(plan_globals_k0pf g) {
     const int N   = g.world * g.T;
     const int ntc = (N + K0PF_TOF_ITEMS - 1) / K0PF_TOF_ITEMS;   // chunks per rank (<= 16)
     if (ntc > K0PF_TOF_MAXCHUNK) {                               // tof_part capacity guard
         if (blockIdx.x == 0 && threadIdx.x == 0) atomicOr(&g.err[{0, 0, 0, 0}], 16);
-        return;                                                  // FAIL LOUD, never corrupt
+        return;
     }
     const int p   = blockIdx.x / ntc;
     const int c   = blockIdx.x % ntc;
@@ -226,7 +192,7 @@ __global__ void e12_count_kernel(plan_globals_k0pf g) {
     }
 }
 
-// --- 32-padded expert prefix + per-chunk bases (the plan, + the HANDOFF bounds-check hardening) --------
+// --- 32-padded expert prefix and per-chunk bases -----------------------------------------------
 __global__ void e12_scan_kernel(plan_globals_k0pf g) {
     __shared__ int s_erb[E12_MAXE + 1];
     const int E      = g.E;
@@ -247,9 +213,7 @@ __global__ void e12_scan_kernel(plan_globals_k0pf g) {
     }
     __syncthreads();
 
-    // sorted_expert_ids: HARDENED — bounds-checked HERE, not only by the host capacity guard.
-    // (2026-07-25: an undersized PADMAX wrote past the buffer and corrupted num_valid_ids before
-    //  the sorted-row check could report it.)
+    // Bounds-check before writing sorted_expert_ids.
     const int bcap = g.PADMAX / E12_BLOCK_M;
     for (int e = threadIdx.x; e < E; e += blockDim.x) {
         const int b0 = s_erb[e] / E12_BLOCK_M;
@@ -260,8 +224,7 @@ __global__ void e12_scan_kernel(plan_globals_k0pf g) {
         }
     }
 
-    // ccnt[chunk][e] -> exclusive prefix over chunks, based at erb[e].  Serial per expert,
-    // deterministic; ~1024 iterations over 32 threads — measured-cheap, left serial on purpose.
+    // Convert per-chunk counts to deterministic expert-relative prefixes.
     for (int e = threadIdx.x; e < E; e += blockDim.x) {
         int acc = s_erb[e];
         for (int c = 0; c < NCHUNK; ++c) {
@@ -272,11 +235,8 @@ __global__ void e12_scan_kernel(plan_globals_k0pf g) {
     }
 }
 
-// --- padding sentinel, NOW BOUNDED by device nvi[0] -----------------------------------------------
-// Runs after scan (same stream) so nvi[0] is final.  Rows [0, nvi[0]) get the sentinel; rows beyond
-// are never read by any consumer (nvi[0] is 32-aligned; the GEMM block walk is nvi[0]-bounded, the
-// gather/combine are nvi[1]-bounded).  Final state within [0, nvi[0]) is byte-identical to the
-// frozen full-capacity sweep; the sorted kernel then overwrites the live rows, as before.
+// --- padding sentinel -------------------------------------------------------------------------
+// Initialize only rows below device-computed nvi[0].
 __global__ void e12_pad_kernel(plan_globals_k0pf g) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= g.PADMAX) return;
@@ -287,7 +247,7 @@ __global__ void e12_pad_kernel(plan_globals_k0pf g) {
     g.sorted_weights [{0, 0, i, 0}] = 0.f;
 }
 
-// --- THE ORDERED COMPACTION ---------------------------------------------------------------------
+// --- ordered compaction -----------------------------------------------------------------------
 __global__ void e12_sorted_kernel(plan_globals_k0pf g) {
     __shared__ int s_cur[E12_MAXE];
     const int c  = blockIdx.x;
@@ -331,10 +291,8 @@ __global__ void e12_sorted_kernel(plan_globals_k0pf g) {
     }
 }
 
-// --- the COMBINE's pull plan — QUADRATIC RECOMPUTE KILLED -----------------------------------------
-// pscan: ONE block.  Per-token fanout f(tau) = sum_p own[p][cur*T+tau] (8 reads), exclusive prefix
-// over [0, T) with a running carry -> pull_ptr[0..T]; pull_ptr[T] = total.  Integer scan: VALUES
-// identical to the frozen serial recompute.
+// --- combine pull plan -------------------------------------------------------------------------
+// Scan per-token fanout into pull_ptr.
 __global__ void k0pf_pscan_kernel(plan_globals_k0pf g) {
     const int N = g.world * g.T;
     const int W = g.world;
@@ -360,7 +318,7 @@ __global__ void k0pf_pscan_kernel(plan_globals_k0pf g) {
     }
 }
 
-// pfill: thread per token — walk its 8 own[] once, emit (producer_rank, producer_row) in rank order.
+// Emit producer rank and row in rank order.
 __global__ void k0pf_pfill_kernel(plan_globals_k0pf g) {
     const int tau = blockIdx.x * blockDim.x + threadIdx.x;
     if (tau >= g.T) return;

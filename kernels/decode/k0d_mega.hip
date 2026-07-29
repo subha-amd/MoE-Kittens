@@ -1,37 +1,11 @@
-// ================================================================================================
-// k0d_mega.hip — decode expert-parallel ingress as a single kernel: push dispatch, cross-rank
-// rendezvous, and destination-side sort/plan construction.
+// Decode push, cross-rank synchronization, and destination sort in one 16-CTA launch.
+// Doorbells are monotonic. Waiting for every peer also proves the previous epoch's combines have
+// stopped reading part before it is cleared. Expert-local scatter order is nondeterministic.
 //
-// Launch: (16 CTAs, 256 threads), one graph node.  It replaces a two-kernel dispatch-then-sort
-// pipeline; the removed launch boundary becomes one more internal grid barrier.  The doorbell
-// wait doubles as proof that this rank's own pushes have landed (its own flag is one of the
-// world flags), so the same CTAs roll straight from pushing into sorting.
-//
-// PHASE MAP
-//   M1  Warp-per-token push sweep: deduplicate the token's TOPK routes by destination GPU,
-//       allocate one receive row per destination with a remote atomic, then post the payload
-//       (7 x 16 B/lane activation + 224 B scales + 32 B expert ids + 32 B route weights).
-//       Owner-side combine metadata (pull_stage / pull_cnt) is written locally as it goes.
-//   M2  Folded rendezvous: per-CTA release fence plus arrival counter; the last CTA bumps
-//       recv_doorbell[cur] on every rank.  Monotonic, never reset.
-//   M3  Every CTA spins on recv_doorbell[peer] >= epoch, then an acquire fence.  This is also
-//       the cross-epoch guard: all doorbells up means every rank's combine for the previous
-//       epoch has retired, so zeroing part and reusing the receive buffers below is safe.
-//   M4  Task split. CTA0 counts rows per local expert, scans to BM32-padded segments, seeds
-//       the scatter cursors and sei/nvi.  CTA1 builds the combine CSR (pull_ptr / pull_src).
-//       CTAs 2..15 zero the live part rows and transpose the FP8 scales to group-major.
-//   M5  Grid barrier.
-//   M6  Pad rows to BM32, then scatter received (row, slot) pairs and weights into sti / swt
-//       through atomic cursors.
-//   M7  Tail: reset dest_counter, advance the epoch.
-//
-// Sort order within an expert is nondeterministic because the scatter uses atomic cursors;
-// acceptance is tolerance-based, not bitwise.
-//
-// pperr bits: 2 padding/scatter row overflow, 8 combine CSR overflow, 128 receive-row overflow,
-// 256 shape guard, 1024 doorbell spin timeout, 2048 T_loc out of range, 4096 scatter cursor
-// overflow, 8192 internal grid-barrier spin timeout.
-// ================================================================================================
+// CTA0 builds expert segments, CTA1 builds the combine CSR, and CTAs 2..15 clear live partial
+// rows and transpose scales. A device-scope grid barrier publishes their outputs before scatter.
+// pperr bits: 2 padding overflow, 8 CSR overflow, 128 receive overflow, 256 shape guard,
+// 1024 doorbell timeout, 2048 T_loc range, 4096 scatter overflow, 8192 grid-barrier timeout.
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -86,7 +60,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_mega(
 
   const unsigned int epoch = sort_count[0] + 1u;
 
-  // ================= M1: push sweep (warp per token) ======================================
+  // Push sweep: one warp per token.
   {
     const int gw = bid * (blockDim.x >> 6) + (tid >> 6);
     const int nw = gridDim.x * (blockDim.x >> 6);
@@ -174,7 +148,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_mega(
     }
   }
 
-  // ================= M2: folded rendezvous (doorbell) =====================================
+  // Publish pushes through the doorbell.
   __syncthreads();
   if (tid == 0) {
     __threadfence_system();
@@ -194,7 +168,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_mega(
     }
   }
 
-  // ================= M3: doorbell wait + cross-epoch guard ================================
+  // Wait for peer pushes and previous-epoch readers.
   if (tid < world) {
     volatile const unsigned int* vf = recv_doorbell;
     long long spins = 0;
@@ -212,7 +186,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_mega(
     return;
   }
 
-  // ================= M4: task-split plan work =============================================
+  // Build plan metadata and prepare live rows.
   if (bid == 0) {
     __shared__ int s_cnt[K0DM_MAXE];
     for (int i = tid; i < E; i += 256) s_cnt[i] = 0;
@@ -287,7 +261,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_mega(
     }
   }
 
-  // ================= M5: grid barrier =====================================================
+  // Publish local plan work.
   __syncthreads();
   if (tid == 0) {
     __threadfence();
@@ -304,7 +278,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_mega(
   __syncthreads();
   __threadfence();
 
-  // ================= M6: pad + scatter ====================================================
+  // Pad expert segments and scatter live pairs.
   {
     const int lo = cur * E, hi = lo + E;
     for (int idx = bid * 256 + tid; idx < E * 32; idx += gridDim.x * 256) {
@@ -329,7 +303,7 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0d_mega(
     }
   }
 
-  // ================= M7: tail =============================================================
+  // Reset the allocator and advance the epoch.
   __syncthreads();
   if (bid == 0 && tid == 0) {
     dest_counter[0] = 0u;

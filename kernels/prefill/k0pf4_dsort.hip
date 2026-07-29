@@ -1,47 +1,11 @@
-// ================================================================================================
-// k0pf4_dsort.hip — k0pf3_dsort with a hierarchical multi-CTA expert histogram.
-//
-// Identical contract, identical downstream, identical protocol.  The only change is the count
-// phase.  k0pf3_dsort gives the whole per-expert count to CTA0, which at prefill means T_loc *
-// TOPK LDS atomics on a single CU — on the hottest rank that is over 150k pairs, and it runs long
-// after the other CTAs have finished zeroing part and gone idle.  Because that rank sets the
-// region's pace, the serial count is region time.
-//
-// Here every CTA histograms a disjoint grid-stride slice into LDS, publishes its own [E] counts to
-// local global scratch (hcnt, expert-major), and after one extra grid barrier CTA0 reduces the
-// [E][gridDim] table into exactly the s_cnt the padded scan already consumed.  Integer addition is
-// associative, so the counts are bit-identical to the single-CTA version rather than merely
-// equivalent.
-//
-// Everything else is behaviour-preserved from k0pf3_dsort.hip:
-//   * P0 doorbell wait (bounded, fail-closed, bit 262144), acquire fence, T_loc range guard.
-//   * The scan, cursors and sei, padding, atomic-cursor scatter and pull_src fill are the same
-//     stages, expressed through the hkp headers.
-//   * zero part[0, T_loc) and the row-major to group-major scale transpose on CTAs 2.., with the
-//     same 14 x 1 KB warp chunking and the same live-prefix-only extent.
-//   * epoch = sort_count[0] + 1; the dest_counter reset and the epoch advance stay at the tail,
-//     which is their sole consumer.
-//   * Sort order remains nondeterministic (atomic cursors), so acceptance stays tolerance-based.
-//
-// hcnt is local scratch, fully overwritten every epoch and never accumulated, so it adds no
-// protocol state and the monotonic-epoch graph-replay argument is unchanged.
-//
-// PHASES:
-//   P0  doorbell wait, then T_loc.
-//   P1a all CTAs: LDS histogram over a disjoint slice into hcnt[e * gridDim + bid].
-//   P1b grid barrier 1, publishing hcnt.
-//   P1c CTA0 reduces, runs the padded scan, and writes nvi, cursors and sei;  CTA1 turns pull_cnt
-//       into pull_ptr;  CTAs 2.. zero part[0, T_loc) and transpose the scales.  The plan work now
-//       hides under the part zero, so the count is off every rank's critical path.
-//   P2  grid barrier 2, publishing scratch, nvi, sei, pull_ptr, part and sc_dst.
-//   P3  padding sentinel, atomic-cursor scatter, pull_src compaction.
-//   P4  tail: dest_counter[0] = 0, sort_count[0] = epoch.
+// Destination sort with a hierarchical multi-CTA expert histogram. Each CTA publishes a disjoint
+// partial histogram to expert-major hcnt; CTA0 reduces it after a grid barrier. hcnt is fully
+// overwritten each epoch. Remaining sort, CSR, scale, and epoch contracts match k0pf3_dsort.
 //
 // pperr bits are unchanged from k0pf3_dsort: 262144 doorbell spin timeout, 524288 T_loc out of
 // range, 1048576 scatter/CSR row overflow, 2097152 internal grid-barrier spin timeout, 4194304
 // pad row overflow (PADMAX), 131072 shape guard.
 // Scratch layout (LOCAL int scratch[256]): erb[0..64] at 0, cnt at 80, cursors at 160.
-// ================================================================================================
 
 #define MORI_SHMEM_NO_STATIC_INIT
 #define MORI_SHMEM_ENABLE_WEAK_GLOBAL_GPU_STATES
@@ -100,18 +64,18 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf4_dsort(
 
   const unsigned int epoch = hkp::epoch_from_cell(sort_count);
 
-  // ================= P0: doorbell wait (also the cross-epoch part guard) ==================
+  // Wait for payloads and previous-epoch readers.
   if (tid < world) {
     hkp::bounded_wait(reinterpret_cast<volatile const unsigned int*>(recv_doorbell) + tid,
                       epoch, spin_limit, hkp::fail_closed{pperr, 262144});
   }
   __syncthreads();
-  __threadfence_system();   // acquire: recv payloads, dest_counter, and the part-reuse proof
+  __threadfence_system();   // Acquire payloads, counter, and the part-reuse guard.
 
   const int T_loc = (int)dest_counter[0];
   if (T_loc < 0 || T_loc > T_loc_max) {
     if (bid == 0 && tid == 0) atomicOr(pperr, 524288);
-    return;   // grid-uniform: every CTA reads the same dest_counter, so no CTA reaches a barrier
+    return;   // Grid-uniform because every CTA reads the same counter.
   }
 
   const int lo = cur * E;
@@ -119,25 +83,23 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf4_dsort(
   const hkp::local_grid_epoch bar{gbar, pperr, spin_limit};
   const hkp::fail_closed bar_err{pperr, 2097152};
 
-  // ================= P1a: hierarchical count — every CTA, disjoint slice ==================
+  // Build per-CTA histograms over disjoint slices.
   __shared__ int s_cnt[K0P4_MAXE];
   k0p4_sort::count_partial_publish(recv_eid, pairs, lo, E, s_cnt, hcnt, nct, bid, tid);
 
-  // ================= P1b: grid barrier #1 (publishes hcnt) ================================
+  // Publish partial histograms.
   hkp::grid_barrier(bar, tid, bar_err);
 
-  // ================= P1c: task-split plan work (no barrier) ===============================
+  // Reduce counts, build the CSR, and prepare live rows.
   if (bid == 0) {
     k0p4_sort::count_reduce(hcnt, E, nct, s_cnt, tid);
     k0p4_sort::scan(s_cnt, E, T_loc, scratch, nvi, tid);
     k0p4_sort::cursors_sei(scratch, E, PADMAX, sei, pperr, 4194304, tid);
   } else if (bid == 1) {
-    // ---- owner combine CSR row pointers: 256-wide block scans over pull_cnt ----
     __shared__ int s_tmp[256];
     __shared__ int s_carry;
     hkp::csr_scan_block256(pull_cnt, pull_ptr, T, tid, s_tmp, &s_carry);
   } else {
-    // ---- zero part[0, T_loc) + transpose scales (needs T_loc only) ----
     const int lane = tid & 63;
     const int w = (bid - 2) * (blockDim.x >> 6) + (tid >> 6);
     const int nw = (nct - 2) * (blockDim.x >> 6);
@@ -148,19 +110,19 @@ extern "C" __global__ void __launch_bounds__(256, 8) k0pf4_dsort(
     }
   }
 
-  // ================= P2: grid barrier #2 (publishes scratch + nvi + pull_ptr) =============
+  // Publish local plan outputs.
   hkp::grid_barrier(bar, tid, bar_err);
 
-  // ================= P3: pad sentinel + atomic-cursor scatter + CSR fill ==================
+  // Pad, scatter, and fill the combine CSR.
   k0p4_sort::pad(scratch, E, T_loc, TOPK, PADMAX, sti, swt, pperr, 4194304);
   k0p4_sort::scatter(recv_eid, recv_wgt, pairs, lo, E, TOPK, PADMAX, scratch, sti, swt,
                      pperr, 1048576);
   hkp::pull_src_fill(pull_stage, pull_ptr, T, TOPK, T * world, pull_src, pperr, 1048576);
 
-  // ================= P4: tail — reset allocator, advance epoch ============================
+  // Reset the allocator and advance the epoch.
   __syncthreads();
   if (bid == 0 && tid == 0) {
-    dest_counter[0] = 0u;     // next epoch's allocations restart at row 0
-    hkp::advance_epoch_cell(sort_count, epoch);   // plain store; next kernel reads it
+    dest_counter[0] = 0u;
+    hkp::advance_epoch_cell(sort_count, epoch);
   }
 }

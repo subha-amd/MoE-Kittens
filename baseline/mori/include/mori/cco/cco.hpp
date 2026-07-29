@@ -850,7 +850,7 @@ struct ccoComm;  // device/kernel TUs: opaque handle only
 //   /* broadcast id to all ranks */
 //   ccoCommCreate(id, nRanks, rank, vmm, &comm);
 //
-// ccoUniqueId encodes rank 0's socket rendezvous address; the interface is
+// ccoUniqueId encodes rank 0's socket coordination address; the interface is
 // picked from MORI_SOCKET_IFNAME (see socket bootstrap docs).
 struct ccoUniqueId {
   char internal[128];
